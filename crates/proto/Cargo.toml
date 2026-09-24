@@ -1,0 +1,17 @@
+[package]
+name = "x2rp-proto"
+version.workspace = true
+edition.workspace = true
+description = "Tunnel protocol and host helpers shared by the x2rp server and connector"
+
+[dependencies]
+bytes = "1.11"
+tokio = { version = "1", features = ["net", "sync"] }
+quinn = { version = "0.11.9", default-features = false }
+rand = "0.10.1"
+chacha20 = "0.10.0"
+socket2 = "0.6"
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }

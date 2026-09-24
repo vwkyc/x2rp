@@ -1,0 +1,56 @@
+[package]
+name = "x2rp"
+version.workspace = true
+edition.workspace = true
+description = "x2rp: TLS-terminating reverse proxy with an embedded admin UI"
+
+[lib]
+name = "x2rp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "x2rp"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["set-header"] }
+pingora-core = { version = "0.9", default-features = false, features = ["rustls"] }
+pingora-proxy = { version = "0.9", default-features = false, features = ["rustls"] }
+pingora-http = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# ring, as rustls and quinn use: the default aws-lc would link a second crypto library.
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
+x509-parser = "0.16"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+governor = "0.10"
+rand = "0.10"
+argon2 = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.11"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+parking_lot = "0.12"
+dashmap = "6"
+http = "1"
+bytes = "1"
+async-trait = "0.1"
+futures-util = "0.3"
+socket2 = "0.6"
+ipnet = "2"
+quinn = "0.11"
+mimalloc = { version = "0.1", default-features = false }
+x2rp-proto = { path = "../proto" }
+
+[dev-dependencies]
+rcgen = "0.14"
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+tokio-tungstenite = "0.29"

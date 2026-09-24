@@ -1,0 +1,8 @@
+# Workspace cargo-audit config
+# Keep ignore list limited to upstream issues that cannot be fixed in-tree.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0388", # derivative (via pingora-core)
+    "RUSTSEC-2025-0134", # rustls-pemfile (via pingora-rustls)
+]

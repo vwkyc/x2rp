@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>x2rp</title>
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><span class="brand-mark"></span>x2rp</div>
+      <nav class="tabs">
+        <button class="tab is-current" data-view="connectors">Connectors</button>
+        <button class="tab" data-view="routes">Routes</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="content">
+    <section id="view-connectors" class="view">
+      <div class="view-head">
+        <div>
+          <h1>Connectors</h1>
+          <p>Agents on private networks that dial out to this server.</p>
+        </div>
+        <button id="add-connector" class="button button-primary">New connector</button>
+      </div>
+      <div id="connector-list"></div>
+    </section>
+
+    <section id="view-routes" class="view is-hidden">
+      <div class="view-head">
+        <div>
+          <h1>Routes</h1>
+          <p>Subdomains and the services they forward to.</p>
+        </div>
+        <button id="add-route" class="button button-primary">New route</button>
+      </div>
+      <div id="route-list"></div>
+    </section>
+  </main>
+
+  <div id="sheet-add-connector" class="overlay is-hidden">
+    <form id="add-connector-form" class="sheet">
+      <div class="sheet-head">
+        <div>
+          <h2>New connector</h2>
+          <p>Name it after the host it will run on.</p>
+        </div>
+        <button type="button" class="sheet-close" aria-label="Close">&times;</button>
+      </div>
+      <div class="field">
+        <label for="add-connector-name">Name</label>
+        <input type="text" id="add-connector-name" placeholder="home-server" required autocomplete="off">
+      </div>
+      <div class="sheet-actions">
+        <button type="button" class="button button-quiet" data-close>Cancel</button>
+        <button type="submit" class="button button-primary">Create</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="sheet-install" class="overlay is-hidden">
+    <div class="sheet sheet-wide">
+      <div class="sheet-head">
+        <div>
+          <h2>Install the connector</h2>
+          <p>Run this on the private host. The token in it is shown only once.</p>
+        </div>
+        <button type="button" class="sheet-close" aria-label="Close">&times;</button>
+      </div>
+      <pre id="install-command" class="code-box"></pre>
+      <div class="sheet-actions">
+        <button type="button" id="copy-install" class="button">Copy</button>
+        <button type="button" class="button button-primary" data-close>Done</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="sheet-connector" class="overlay is-hidden">
+    <div class="sheet">
+      <div class="sheet-head">
+        <h2 id="connector-title">Connector</h2>
+        <button type="button" class="sheet-close" aria-label="Close">&times;</button>
+      </div>
+      <dl class="facts">
+        <dt>Status</dt><dd id="connector-state">-</dd>
+        <dt>Last seen</dt><dd id="connector-heartbeat">-</dd>
+      </dl>
+      <div class="setting">
+        <div>
+          <div class="setting-name">WebSocket only</div>
+          <p class="help">Skip QUIC and always connect over TCP 443. Use it where a firewall blocks or throttles UDP.</p>
+        </div>
+        <label class="switch"><input type="checkbox" id="connector-wss" aria-label="WebSocket only"><span class="switch-rail"></span></label>
+      </div>
+      <div class="sheet-actions">
+        <button type="button" id="remove-connector" class="button button-danger">Delete</button>
+        <button type="button" id="rotate-token" class="button">Regenerate token</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="sheet-route" class="overlay is-hidden">
+    <form id="route-form" class="sheet sheet-wide">
+      <div class="sheet-head">
+        <h2 id="route-title">New route</h2>
+        <button type="button" class="sheet-close" aria-label="Close">&times;</button>
+      </div>
+      <div class="form-stack">
+        <div class="field">
+          <label for="route-subdomain">Subdomain</label>
+          <input type="text" id="route-subdomain" placeholder="app" required autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="route-via">Reached through</label>
+          <select id="route-via"></select>
+        </div>
+        <div class="field">
+          <label for="route-origin">Target</label>
+          <input type="text" id="route-origin" required autocomplete="off">
+          <p class="help" id="route-origin-help"></p>
+        </div>
+        <div class="field">
+          <label for="route-allow">Allowed clients<span class="optional">optional</span></label>
+          <input type="text" id="route-allow" placeholder="203.0.113.10, 198.51.100.0/24" autocomplete="off">
+          <p class="help">IPs or CIDR blocks, comma-separated. Leave empty to allow everyone.</p>
+        </div>
+      </div>
+      <div class="sheet-actions">
+        <button type="button" id="remove-route" class="button button-danger is-hidden">Delete</button>
+        <button type="button" class="button button-quiet" data-close>Cancel</button>
+        <button type="submit" id="route-save" class="button button-primary">Create</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

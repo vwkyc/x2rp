@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/server", "crates/connector", "crates/proto"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"
+
+[profile.dev]
+debug = 1

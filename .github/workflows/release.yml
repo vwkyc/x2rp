@@ -1,0 +1,83 @@
+# Push a tag vX.Y.Z matching the workspace version to publish a release:
+# static musl binaries of x2rp and x2rp-connector for x86_64 and aarch64, the two
+# installers pointed at that release, and SHA256SUMS.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag matches the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "tag $GITHUB_REF_NAME, Cargo.toml says $version"; exit 1; }
+      - run: rustup update stable --no-self-update
+      - run: cargo test --workspace --locked
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          # rust-musl-cross images carry the musl cross toolchains and cmake the C
+          # dependencies need. Pinned by digest; bump both together.
+          - arch: x86_64
+            image: ghcr.io/rust-cross/rust-musl-cross@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a
+          - arch: aarch64
+            image: ghcr.io/rust-cross/rust-musl-cross@sha256:ecae5dd62d1c938c14f8071d36c16fa699860aace03bfb5284fb1216474d2643
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        # X2RP_REPO makes the admin console hand out a connector install command
+        # for this release.
+        run: |
+          docker run --rm -v "$PWD":/src -w /src -e X2RP_REPO="$GITHUB_REPOSITORY" \
+            ${{ matrix.image }} cargo build --release --locked -p x2rp -p x2rp-connector
+          mkdir dist
+          for bin in x2rp x2rp-connector; do
+            cp "target/${{ matrix.arch }}-unknown-linux-musl/release/$bin" "dist/$bin-${{ matrix.arch }}"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bin-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+          for script in install.sh install-connector.sh; do
+            sed "s|@RELEASE_URL@|$url|" "scripts/$script" > "dist/$script"
+          done
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes ./*

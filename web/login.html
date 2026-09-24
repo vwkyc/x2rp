@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in · x2rp</title>
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <main class="gate">
+    <form id="signin" class="gate-card">
+      <div class="brand"><span class="brand-mark"></span>x2rp</div>
+      <p class="gate-lead">Sign in to the admin console.</p>
+      <label for="signin-password">Password</label>
+      <input type="password" id="signin-password" required autocomplete="current-password" maxlength="128" autofocus>
+      <p id="signin-error" class="gate-error" hidden></p>
+      <button type="submit" class="button button-primary">Sign in</button>
+    </form>
+  </main>
+  <script src="/login.js"></script>
+</body>
+</html>
