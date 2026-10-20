@@ -5,10 +5,7 @@ use crate::api::random_hex;
 use std::time::SystemTime;
 
 use anyhow::Result;
-use argon2::{
-    Algorithm, Argon2, Params, Version,
-    password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
-};
+use argon2::{Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version};
 use dashmap::DashMap;
 
 const SESSION_IDLE_TTL_SECS: u64 = 300;
@@ -112,9 +109,9 @@ fn argon2id() -> Argon2<'static> {
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
+    // Salt drawn from the OS RNG by argon2 itself.
     let hash = argon2id()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?;
     Ok(hash.to_string())
 }
@@ -141,13 +138,11 @@ pub async fn verify_password_async(password: String, hash: String) -> bool {
         .unwrap_or(false)
 }
 
+/// Parameters come from the stored PHC string, not `argon2id()`'s.
 fn verify_password_hash(password: &str, hash: &str) -> bool {
-    use argon2::password_hash::{PasswordHash, PasswordVerifier};
-    PasswordHash::new(hash).is_ok_and(|parsed| {
-        argon2id()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok()
-    })
+    argon2id()
+        .verify_password(password.as_bytes(), hash)
+        .is_ok()
 }
 
 fn elapsed_secs_since(timestamp: SystemTime) -> u64 {
@@ -190,6 +185,23 @@ mod tests {
             ARGON2_MAX_CONCURRENT,
             "a permit leaked"
         );
+    }
+
+    /// An installed server's admin hash was written by argon2 0.5. If a later
+    /// release stopped verifying it, the admin would be locked out.
+    #[test]
+    fn hashes_from_earlier_argon2_releases_still_verify() {
+        // argon2 0.5.3, these parameters, salt "saltsaltsaltsalt", "compat-vector-pw".
+        const HASH: &str = "$argon2id$v=19$m=9216,t=4,p=1$c2FsdHNhbHRzYWx0c2FsdA$k+YJy7fjLPBHMk9HdGP0Wj+vgdeYtCb5YPjZI6D2pbE";
+        assert!(verify_password_hash("compat-vector-pw", HASH));
+        assert!(!verify_password_hash("compat-vector-px", HASH));
+
+        let fresh = hash_password("compat-vector-pw").expect("hash");
+        assert!(
+            fresh.starts_with("$argon2id$v=19$m=9216,t=4,p=1$"),
+            "{fresh}"
+        );
+        assert!(verify_password_hash("compat-vector-pw", &fresh));
     }
 
     #[test]

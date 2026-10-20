@@ -374,7 +374,7 @@ impl SendCredit {
     pub fn add(&self, bytes: usize) {
         let _ = self
             .credit
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 let next = cur.saturating_add(bytes as i64).min(self.max);
                 (next > cur).then_some(next)
             });
@@ -398,7 +398,7 @@ impl SendCredit {
             }
             if self
                 .credit
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                     (cur >= need).then(|| cur - need)
                 })
                 .is_ok()

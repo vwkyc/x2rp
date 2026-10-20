@@ -45,9 +45,11 @@ main() {
         [[ -f $UNIT || -f $BIN ]] || { echo "$NAME is not installed"; exit 0; }
         confirm "Remove $NAME?" || exit 0
         # Tell the server first so the admin console shows it offline right away.
+        # The token goes to curl on stdin, so it never shows in the process list.
         if [[ -f $CONF ]] && command -v jq >/dev/null; then
-            curl -fsS -m 5 -X POST "$(jq -r .server "$CONF")/api/connector/disconnect" \
-                -H "Authorization: Bearer $(jq -r .token "$CONF")" >/dev/null 2>&1 || true
+            printf 'Authorization: Bearer %s\n' "$(jq -r .token "$CONF")" |
+                curl -fsS -m 5 -X POST -H @- "$(jq -r .server "$CONF")/api/connector/disconnect" \
+                    >/dev/null 2>&1 || true
         fi
         stop_service
         rm -rf "$UNIT" "$BIN" "$CONF_DIR" "$HOME_DIR" "$SYSCTL"

@@ -97,7 +97,7 @@ impl ConnectorManager {
     fn try_reserve_stream_slot(&self) -> bool {
         let limit = MAX_ACTIVE_STREAMS as u32;
         self.active_streams
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
                 (current < limit).then_some(current + 1)
             })
             .is_ok()
@@ -107,7 +107,7 @@ impl ConnectorManager {
     fn release_stream_slot(&self) {
         let _ = self
             .active_streams
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |c| c.checked_sub(1));
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |c| c.checked_sub(1));
     }
 
     /// Idempotent teardown of one WSS stream: frees its slot, wakes its upload, and
@@ -352,8 +352,15 @@ where
     let (send, recv) = tokio::time::timeout(CONNECT_TIMEOUT, open)
         .await
         .map_err(|_| format!("connection timed out ({}s)", CONNECT_TIMEOUT.as_secs()))??;
-    if let Err(e) =
-        tokio::io::copy_bidirectional(&mut stream, &mut tokio::io::join(recv, send)).await
+    // TUNNEL_READ_CHUNK, as the WSS pumps read: tokio's 8 KiB default means four
+    // times the stream writes, each taking the connection's lock.
+    if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
+        &mut stream,
+        &mut tokio::io::join(recv, send),
+        TUNNEL_READ_CHUNK,
+        TUNNEL_READ_CHUNK,
+    )
+    .await
     {
         debug!("QUIC tunnel ended: {e}");
     }

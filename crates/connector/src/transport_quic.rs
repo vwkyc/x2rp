@@ -1,6 +1,6 @@
 //! QUIC transport: `Auth` on the first stream, then one server-opened stream per
 //! tunnel (protocol: `x2rp_proto` docs). Each tunnel is spliced to its backend with
-//! `copy_bidirectional`, so QUIC's per-stream flow control is the only
+//! `copy_bidirectional_with_sizes`, so QUIC's per-stream flow control is the only
 //! backpressure and a slow tunnel never blocks another.
 
 use std::io;
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use quinn::{ClientConfig, Connection, ConnectionError, Endpoint, RecvStream, SendStream};
 use x2rp_proto::obfs::ObfuscatedSocket;
-use x2rp_proto::{ALPN, Message, read_frame};
+use x2rp_proto::{ALPN, Message, TUNNEL_READ_CHUNK, read_frame};
 
 use crate::transport::{TransportConfig, connect_any, connect_backend};
 
@@ -137,7 +137,15 @@ async fn splice_data_stream(mut send: SendStream, mut recv: RecvStream) {
         let _ = send.finish();
         return;
     };
-    match tokio::io::copy_bidirectional(&mut backend, &mut tokio::io::join(recv, send)).await {
+    // Same chunk as the server's end of the splice (see `connector_manager::quic_tunnel`).
+    match tokio::io::copy_bidirectional_with_sizes(
+        &mut backend,
+        &mut tokio::io::join(recv, send),
+        TUNNEL_READ_CHUNK,
+        TUNNEL_READ_CHUNK,
+    )
+    .await
+    {
         Ok((up, down)) => {
             tracing::debug!("QUIC tunnel {stream_id} closed (up {up} / down {down} bytes)")
         }
