@@ -202,7 +202,7 @@ on the private host. The token is shown once. The command installs the
 connector version matching the server:
 
 ```sh
-curl -fsSL https://github.com/vwkyc/x2rp/releases/download/v1.0.1/install-connector.sh | sudo bash -s -- --server https://x2rp.example.com --token '<token>'
+curl -fsSL https://github.com/vwkyc/x2rp/releases/download/v1.0.2/install-connector.sh | sudo bash -s -- --server https://x2rp.example.com --token '<token>'
 ```
 
 Keep connectors on the server's version. After upgrading the server, run the
