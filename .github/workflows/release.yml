@@ -26,16 +26,18 @@ jobs:
 
   build:
     needs: test
-    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
           # rust-musl-cross images carry the musl cross toolchains and cmake the C
           # dependencies need. Pinned by digest; bump both together.
           - arch: x86_64
+            runner: ubuntu-24.04
             image: ghcr.io/rust-cross/rust-musl-cross@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a
           - arch: aarch64
+            runner: ubuntu-24.04-arm
             image: ghcr.io/rust-cross/rust-musl-cross@sha256:ecae5dd62d1c938c14f8071d36c16fa699860aace03bfb5284fb1216474d2643
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
