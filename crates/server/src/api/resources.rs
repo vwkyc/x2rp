@@ -103,13 +103,17 @@ fn check_ssrf_strict(host: &str) -> Result<(), &'static str> {
     }
 }
 
-/// `http(s)://host[:port]` with no path or query → (unbracketed host, port).
-fn parse_http_target_host_port(target: &str) -> Result<(String, u16), &'static str> {
+/// `http(s)://host[:port]` with no path or query → (unbracketed host, port, TLS).
+/// The scheme is the *parsed* one (`http`/`https` are matched case-insensitively and
+/// normalised), never the raw prefix: `HTTPS://` is still https.
+fn parse_http_target_host_port(target: &str) -> Result<(String, u16, bool), &'static str> {
     let uri: http::Uri = target.parse().map_err(|_| "Invalid target URL")?;
     let scheme = uri.scheme_str().ok_or("Invalid scheme")?;
-    if scheme != "http" && scheme != "https" {
-        return Err("Invalid scheme");
-    }
+    let tls = match scheme {
+        "http" => false,
+        "https" => true,
+        _ => return Err("Invalid scheme"),
+    };
     if let Some(path_and_query) = uri.path_and_query()
         && (!matches!(path_and_query.path(), "" | "/") || path_and_query.query().is_some())
     {
@@ -120,16 +124,14 @@ fn parse_http_target_host_port(target: &str) -> Result<(String, u16), &'static s
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    let port = uri
-        .port_u16()
-        .unwrap_or(if scheme == "https" { 443 } else { 80 });
-    Ok((host.to_string(), port))
+    let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    Ok((host.to_string(), port, tls))
 }
 
 /// Shape and SSRF gate, before any state lock is taken. Shared by create and
 /// update so the two cannot drift into admitting different origins.
 async fn validate_target(target: &str, connector_id: Option<&str>) -> Result<(), http::StatusCode> {
-    let (host, port) = parse_http_target_host_port(target).map_err(|reason| {
+    let (host, port, tls) = parse_http_target_host_port(target).map_err(|reason| {
         tracing::warn!("Invalid target {target}: {reason}");
         http::StatusCode::BAD_REQUEST
     })?;
@@ -137,8 +139,9 @@ async fn validate_target(target: &str, connector_id: Option<&str>) -> Result<(),
         tracing::warn!("Invalid target host: {target}");
         return Err(http::StatusCode::BAD_REQUEST);
     }
-    // The connector opens plain TCP to the origin; TLS to it is not supported.
-    if connector_id.is_some() && target.starts_with("https") {
+    // The connector opens plain TCP to the origin; TLS to it is not supported. The
+    // parsed scheme, not the raw prefix, so `HTTPS://` cannot slip past this.
+    if connector_id.is_some() && tls {
         tracing::warn!("Connector targets must be http://: {target}");
         return Err(http::StatusCode::BAD_REQUEST);
     }
@@ -357,6 +360,12 @@ mod tests {
         );
         assert!(
             validate_target("https://192.168.1.10:8443", Some("c"))
+                .await
+                .is_err()
+        );
+        // The scheme is compared parsed, not by raw prefix: case cannot smuggle TLS in.
+        assert!(
+            validate_target("HTTPS://192.168.1.10:8443", Some("c"))
                 .await
                 .is_err()
         );

@@ -48,12 +48,24 @@ pub struct Resource {
     pub allowed_client_cidrs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
     /// Cloudflare API token for DNS-01 ACME challenges (wildcard TLS).
     pub cf_api_token: String,
     /// Shared secret for the QUIC tunnel's UDP obfuscation.
     pub obfuscation_secret: String,
+}
+
+/// Hand-written for the same reason as [`x2rp_proto::Message`]'s: a derive would put
+/// the Cloudflare token and the QUIC obfuscation secret into any `{:?}` that ever
+/// reaches a log.
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("cf_api_token", &"[redacted]")
+            .field("obfuscation_secret", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -189,6 +201,29 @@ pub(crate) fn extract_cookie<'a>(cookies: &'a str, name: &str) -> Option<&'a str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_never_leaks_server_secrets() {
+        let config = ServerConfig {
+            cf_api_token: "cf-secret-token".into(),
+            obfuscation_secret: "quic-obfuscation-secret".into(),
+        };
+        let out = format!("{config:?}");
+        assert!(
+            !out.contains("cf-secret-token") && !out.contains("quic-obfuscation-secret"),
+            "{out}"
+        );
+        // The state that embeds it inherits the redaction.
+        let state = AppState {
+            server_config: config,
+            ..Default::default()
+        };
+        let out = format!("{state:?}");
+        assert!(
+            !out.contains("cf-secret-token") && !out.contains("quic-obfuscation-secret"),
+            "{out}"
+        );
+    }
 
     #[test]
     fn connector_lookup_resolves_only_known_tokens() {
