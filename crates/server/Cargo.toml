@@ -16,9 +16,9 @@ path = "src/main.rs"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["set-header"] }
-pingora-core = { version = "0.9", default-features = false, features = ["rustls"] }
-pingora-proxy = { version = "0.9", default-features = false, features = ["rustls"] }
-pingora-http = "0.9"
+pingora-core = { version = "0.9.1", default-features = false, features = ["rustls"] }
+pingora-proxy = { version = "0.9.1", default-features = false, features = ["rustls"] }
+pingora-http = "0.9.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # ring, as rustls and quinn use: the default aws-lc would link a second crypto library.
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
