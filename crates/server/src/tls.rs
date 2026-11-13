@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use instant_acme::{
-    Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
+    NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use serde::Deserialize;
 
@@ -122,6 +122,9 @@ impl CertManager {
         let mut authorizations = order.authorizations();
         while let Some(auth) = authorizations.next().await {
             let mut auth = auth?;
+            if auth.status == AuthorizationStatus::Valid {
+                continue;
+            }
             let record_name = dns01_record_name(auth.identifier().identifier, &self.domain);
             let challenge = auth
                 .challenge(ChallengeType::Dns01)
@@ -134,16 +137,21 @@ impl CertManager {
             );
         }
 
-        // A fixed wait, not a resolver poll: recursive views lag the authoritative one.
-        tracing::info!(
-            "Waiting {}s for DNS propagation before ACME validation...",
-            DNS_PROPAGATION_WAIT.as_secs()
-        );
-        tokio::time::sleep(DNS_PROPAGATION_WAIT).await;
+        if !record_ids.is_empty() {
+            // A fixed wait, not a resolver poll: recursive views lag the authoritative one.
+            tracing::info!(
+                "Waiting {}s for DNS propagation before ACME validation...",
+                DNS_PROPAGATION_WAIT.as_secs()
+            );
+            tokio::time::sleep(DNS_PROPAGATION_WAIT).await;
+        }
 
         let mut authorizations = order.authorizations();
         while let Some(auth) = authorizations.next().await {
             let mut auth = auth?;
+            if auth.status == AuthorizationStatus::Valid {
+                continue;
+            }
             let mut challenge = auth
                 .challenge(ChallengeType::Dns01)
                 .context("No DNS-01 challenge in authorization")?;

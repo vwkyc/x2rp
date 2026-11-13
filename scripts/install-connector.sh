@@ -54,7 +54,7 @@ main() {
         stop_service
         rm -rf "$UNIT" "$BIN" "$CONF_DIR" "$HOME_DIR" "$SYSCTL"
         systemctl daemon-reload
-        id -u "$NAME" >/dev/null 2>&1 && userdel "$NAME" || true
+        if id -u "$NAME" >/dev/null 2>&1; then userdel "$NAME"; fi
         echo "$NAME removed"
         exit 0
     fi

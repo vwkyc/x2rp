@@ -245,16 +245,30 @@ impl Message {
         }
     }
 
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Connect { target, .. } => 1 + 4 + 2 + target.len().min(MAX_CONNECT_TARGET_LEN),
+            Self::ConnectOk { .. } | Self::Close { .. } | Self::Reset { .. } => 5,
+            Self::ConnectErr { error, .. } => {
+                1 + 4 + 2 + error.floor_char_boundary(MAX_CONNECT_ERR_LEN)
+            }
+            Self::Data { payload, .. } => 1 + 4 + 4 + payload.len().min(MAX_DATA_PAYLOAD_LEN),
+            Self::WindowUpdate { .. } => 1 + 4 + 4,
+            Self::Auth { token } => 1 + 2 + token.len().min(MAX_AUTH_TOKEN_LEN),
+        }
+    }
+
     /// The message body: one WebSocket binary message.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(self.encoded_len());
         self.encode_into(&mut buf)?;
         Ok(buf)
     }
 
     /// `[u32 BE body_len][body]`: one frame on a QUIC stream.
     pub fn frame(&self) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0; 4];
+        let mut buf = Vec::with_capacity(4 + self.encoded_len());
+        buf.resize(4, 0);
         self.encode_into(&mut buf)?;
         let body_len = (buf.len() - 4) as u32;
         buf[..4].copy_from_slice(&body_len.to_be_bytes());

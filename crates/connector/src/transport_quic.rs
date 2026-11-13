@@ -87,10 +87,12 @@ async fn connect_to_addr(
         Arc::new(quinn::TokioRuntime),
     )?;
     endpoint.set_default_client_config(client_config);
-    let connection = endpoint
+    let connecting = endpoint
         .connect(server_addr, server_name)
-        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?;
+    let connection = tokio::time::timeout(Duration::from_secs(10), connecting)
         .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "QUIC handshake timed out"))?
         .map_err(io::Error::other)?;
 
     let (mut control, _) = connection.open_bi().await.map_err(io::Error::other)?;

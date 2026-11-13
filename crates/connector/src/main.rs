@@ -65,15 +65,15 @@ struct ServerSettings {
 async fn main() {
     let cli = Cli::parse();
 
-    let default_directive = if cfg!(debug_assertions) {
+    let default_filter = if cfg!(debug_assertions) {
         "x2rp_connector=debug"
     } else {
         "x2rp_connector=info"
     };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(default_directive.parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
 

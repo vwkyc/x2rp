@@ -466,6 +466,8 @@ impl ProxyHttp for Gateway {
             let path = format!("/x2rp-relay/{}", resource.subdomain);
             let mut peer = HttpPeer::new_uds(&path, false, String::new())?;
             peer.options.custom_l4 = Some(relay.clone());
+            // Never pool relay streams across requests (`HttpPeer::new_uds` defaults `idle_timeout` to `None`).
+            peer.options.idle_timeout = Some(Duration::ZERO);
             peer.options.read_timeout = Some(Duration::from_secs(300));
             peer.options.write_timeout = Some(Duration::from_secs(300));
             return Ok(Box::new(peer));

@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
 tower-http = { version = "0.7", features = ["set-header"] }
 pingora-core = { version = "0.9.1", default-features = false, features = ["rustls"] }
 pingora-proxy = { version = "0.9.1", default-features = false, features = ["rustls"] }
