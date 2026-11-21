@@ -5,6 +5,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -17,16 +18,19 @@ use x2rp_proto::{
 
 use crate::transport::connect_backend;
 
+/// Per-stream message cap: prevents tiny-chunk floods from accumulating unbounded
+/// queue nodes inside a single `STREAM_RECV_WINDOW`.
+const STREAM_QUEUE_CAPACITY: usize = 4096;
+
 struct StreamState {
     /// Upload bytes for the backend. `None` after the server's request-side `Close`
     /// (the dropped sender is the EOF); the entry stays until `task` ends, so
     /// half-closed backends still count toward [`MAX_ACTIVE_STREAMS`].
-    ///
-    /// Unbounded: the server's upload sender is credit-gated to
-    /// [`STREAM_RECV_WINDOW`], which is the real byte bound.
-    request_tx: Option<mpsc::UnboundedSender<Bytes>>,
+    request_tx: Option<mpsc::Sender<Bytes>>,
     /// Download send credit, replenished by the server's `WindowUpdate`s.
     send_credit: Arc<SendCredit>,
+    /// Upload bytes queued ahead of the backend socket write side.
+    recv_outstanding: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 
@@ -51,19 +55,60 @@ impl SessionManager {
         }
     }
 
+    /// Send a control message without parking the mux loop; falls back to a short
+    /// bounded send only if the queue is momentarily full.
+    fn send_control(&self, msg: Message) {
+        if let Err(mpsc::error::TrySendError::Full(msg)) = self.outbound.try_send(msg) {
+            let outbound = self.outbound.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), outbound.send(msg))
+                    .await;
+            });
+        }
+    }
+
     /// Handle an incoming message from the server. Never awaits: the mux loop
     /// must not park behind one stream.
     pub(crate) fn handle_message(&mut self, msg: Message) {
         match msg {
             Message::Connect { stream_id, target } => self.handle_connect(stream_id, target),
             Message::Data { stream_id, payload } => {
-                let delivered = self
-                    .streams
-                    .get(&stream_id)
-                    .and_then(|state| state.request_tx.as_ref())
-                    .is_none_or(|tx| tx.send(payload).is_ok());
-                if !delivered {
+                let mut reset = false;
+                let remove = match self.streams.get(&stream_id) {
+                    Some(state) => match state.request_tx.as_ref() {
+                        Some(tx) => {
+                            let len = payload.len();
+                            let after =
+                                state.recv_outstanding.fetch_add(len, Ordering::AcqRel) + len;
+                            if after > STREAM_RECV_WINDOW {
+                                warn!(
+                                    "Stream {stream_id} exceeded flow-control window ({after} > {STREAM_RECV_WINDOW}), resetting"
+                                );
+                                reset = true;
+                                true
+                            } else {
+                                match tx.try_send(payload) {
+                                    Ok(()) => false,
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        warn!(
+                                            "Stream {stream_id} exceeded message queue cap ({STREAM_QUEUE_CAPACITY}), resetting"
+                                        );
+                                        reset = true;
+                                        true
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => true,
+                                }
+                            }
+                        }
+                        None => false,
+                    },
+                    None => false,
+                };
+                if remove {
                     self.streams.remove(&stream_id);
+                    if reset {
+                        self.send_control(Message::Reset { stream_id });
+                    }
                 }
             }
             // Server request-side EOF: half-close the backend write side, keep reading.
@@ -92,26 +137,26 @@ impl SessionManager {
             warn!("Replacing duplicate stream {stream_id}");
         }
 
-        let outbound = self.outbound.clone();
         if self.streams.len() >= MAX_ACTIVE_STREAMS {
             warn!("Refusing stream {stream_id}: active stream cap ({MAX_ACTIVE_STREAMS}) reached");
-            // Spawned so the overload path cannot park the mux loop on a full queue.
-            tokio::spawn(async move {
-                let error = "connector overloaded".to_string();
-                let _ = outbound
-                    .send(Message::ConnectErr { stream_id, error })
-                    .await;
+            self.send_control(Message::ConnectErr {
+                stream_id,
+                error: "connector overloaded".to_string(),
             });
             return;
         }
 
-        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let outbound = self.outbound.clone();
+
+        let (request_tx, request_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
         let send_credit = Arc::new(SendCredit::new(STREAM_RECV_WINDOW));
+        let recv_outstanding = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(stream_handler(
             stream_id,
             target,
             request_rx,
             send_credit.clone(),
+            recv_outstanding.clone(),
             outbound,
         ));
         self.streams.insert(
@@ -119,6 +164,7 @@ impl SessionManager {
             StreamState {
                 request_tx: Some(request_tx),
                 send_credit,
+                recv_outstanding,
                 task,
             },
         );
@@ -130,8 +176,9 @@ impl SessionManager {
 async fn stream_handler(
     stream_id: u32,
     target: String,
-    mut request_rx: mpsc::UnboundedReceiver<Bytes>,
+    mut request_rx: mpsc::Receiver<Bytes>,
     send_credit: Arc<SendCredit>,
+    recv_outstanding: Arc<AtomicUsize>,
     outbound: mpsc::Sender<Message>,
 ) {
     // Race DNS+TCP against the server abandoning the stream (Close drops the sender).
@@ -142,7 +189,10 @@ async fn stream_handler(
             biased;
             data = request_rx.recv() => match data {
                 None => break Err(io::Error::other("stream abandoned")),
-                Some(_) => debug!("Stream {stream_id} ignoring data before backend connect"),
+                Some(bytes) => {
+                    recv_outstanding.fetch_sub(bytes.len(), Ordering::AcqRel);
+                    debug!("Stream {stream_id} ignoring data before backend connect");
+                }
             },
             result = &mut connect => break result,
         }
@@ -171,8 +221,11 @@ async fn stream_handler(
     let download = async {
         let mut buf = BytesMut::with_capacity(TUNNEL_READ_CHUNK);
         loop {
-            // Never hand read_buf zero capacity: that reads as EOF.
-            buf.reserve(TUNNEL_READ_CHUNK);
+            // Only allocate a fresh slab when remaining capacity is low, so small
+            // reads carve slices out of the existing 32 KiB slab instead of abandoning it.
+            if buf.capacity() < 4096 {
+                buf.reserve(TUNNEL_READ_CHUNK);
+            }
             match rd.read_buf(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
@@ -194,11 +247,14 @@ async fn stream_handler(
     let upload = async {
         let mut drained_since_grant = 0usize;
         while let Some(data) = request_rx.recv().await {
-            if wr.write_all(&data).await.is_err() {
+            let len = data.len();
+            let written = wr.write_all(&data).await;
+            recv_outstanding.fetch_sub(len, Ordering::AcqRel);
+            if written.is_err() {
                 break;
             }
             // Grant drained bytes back so the server's credit-gated upload keeps going.
-            drained_since_grant += data.len();
+            drained_since_grant += len;
             if drained_since_grant >= WINDOW_UPDATE_THRESHOLD {
                 let bytes = drained_since_grant as u32;
                 drained_since_grant = 0;
@@ -228,10 +284,11 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn idle_stream(request_tx: mpsc::UnboundedSender<Bytes>) -> StreamState {
+    fn idle_stream(request_tx: mpsc::Sender<Bytes>) -> StreamState {
         StreamState {
             request_tx: Some(request_tx),
             send_credit: Arc::new(SendCredit::new(STREAM_RECV_WINDOW)),
+            recv_outstanding: Arc::new(AtomicUsize::new(0)),
             task: tokio::spawn(std::future::pending()),
         }
     }
@@ -249,7 +306,7 @@ mod tests {
     async fn exhausted_send_credit_pauses_then_resumes_on_window_update() {
         let (outbound_tx, _outbound_rx) = mpsc::channel(4);
         let mut manager = SessionManager::new(outbound_tx);
-        let (request_tx, _request_rx) = mpsc::unbounded_channel();
+        let (request_tx, _request_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
         let state = idle_stream(request_tx);
         let credit = state.send_credit.clone();
         manager.streams.insert(7, state);
@@ -281,6 +338,32 @@ mod tests {
         assert!(!manager.streams.contains_key(&7), "Reset frees the slot");
     }
 
+    #[tokio::test]
+    async fn upload_over_window_resets_stream() {
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(4);
+        let mut manager = SessionManager::new(outbound_tx);
+        let (request_tx, _request_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+        manager.streams.insert(11, idle_stream(request_tx));
+
+        let chunk = Bytes::from(vec![0u8; 64 * 1024]);
+        for _ in 0..(STREAM_RECV_WINDOW / chunk.len()) {
+            manager.handle_message(Message::Data {
+                stream_id: 11,
+                payload: chunk.clone(),
+            });
+        }
+        assert!(manager.streams.contains_key(&11));
+        manager.handle_message(Message::Data {
+            stream_id: 11,
+            payload: Bytes::from_static(b"x"),
+        });
+        assert!(!manager.streams.contains_key(&11));
+        assert!(matches!(
+            next(&mut outbound_rx).await,
+            Message::Reset { stream_id: 11 }
+        ));
+    }
+
     /// `handle_connect` is sync, so "does not block on a full outbound queue" is a
     /// compile-time property; this pins that the refusal consumes no slot.
     #[tokio::test]
@@ -292,7 +375,7 @@ mod tests {
         let mut manager = SessionManager::new(outbound_tx);
         let mut receivers = Vec::new();
         for stream_id in 0..MAX_ACTIVE_STREAMS as u32 {
-            let (request_tx, request_rx) = mpsc::unbounded_channel();
+            let (request_tx, request_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
             receivers.push(request_rx);
             manager.streams.insert(stream_id, idle_stream(request_tx));
         }
@@ -304,10 +387,11 @@ mod tests {
 
     #[tokio::test]
     async fn stream_handler_abandons_quickly_when_request_side_closed() {
-        let (tx, request_rx) = mpsc::unbounded_channel();
+        let (tx, request_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
         drop(tx); // server already closed the stream
         let (outbound_tx, mut outbound_rx) = mpsc::channel(4);
         let credit = Arc::new(SendCredit::new(STREAM_RECV_WINDOW));
+        let outstanding = Arc::new(AtomicUsize::new(0));
 
         tokio::time::timeout(
             Duration::from_millis(200),
@@ -316,6 +400,7 @@ mod tests {
                 "http://192.0.2.1:9".into(),
                 request_rx,
                 credit,
+                outstanding,
                 outbound_tx,
             ),
         )
@@ -345,14 +430,16 @@ mod tests {
             while matches!(sock.read(&mut buf).await, Ok(1..)) {}
         });
 
-        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (request_tx, request_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
         let (outbound_tx, mut outbound_rx) = mpsc::channel(64);
         let credit = Arc::new(SendCredit::new(STREAM_RECV_WINDOW));
+        let outstanding = Arc::new(AtomicUsize::new(0));
         let handler = tokio::spawn(stream_handler(
             9,
             format!("http://{addr}"),
             request_rx,
             credit,
+            outstanding.clone(),
             outbound_tx,
         ));
         assert!(matches!(
@@ -362,7 +449,8 @@ mod tests {
 
         let chunk = Bytes::from(vec![0u8; TUNNEL_READ_CHUNK]);
         for _ in 0..(WINDOW_UPDATE_THRESHOLD / TUNNEL_READ_CHUNK) {
-            request_tx.send(chunk.clone()).expect("request queue");
+            outstanding.fetch_add(chunk.len(), Ordering::AcqRel);
+            request_tx.send(chunk.clone()).await.expect("request queue");
         }
         match next(&mut outbound_rx).await {
             Message::WindowUpdate {
@@ -391,14 +479,16 @@ mod tests {
             let _ = accepted_tx.send(sock);
         });
 
-        let (_request_tx, request_rx) = mpsc::unbounded_channel();
+        let (_request_tx, request_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
         let (outbound_tx, mut outbound_rx) = mpsc::channel(64);
         let credit = Arc::new(SendCredit::new(STREAM_RECV_WINDOW));
+        let outstanding = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(stream_handler(
             5,
             format!("http://{addr}"),
             request_rx,
             credit,
+            outstanding,
             outbound_tx,
         ));
         assert!(matches!(

@@ -36,7 +36,9 @@ pub async fn auth_login(
     // A floor delay, so success and failure cannot be told apart by response time.
     const LOGIN_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
     let started = std::time::Instant::now();
-    let valid = crate::auth::verify_password_async(req.password, password_hash).await;
+    let Some(valid) = crate::auth::verify_password_async(req.password, password_hash).await else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
     if let Some(remaining) = LOGIN_MIN_DURATION.checked_sub(started.elapsed()) {
         tokio::time::sleep(remaining).await;
     }

@@ -21,8 +21,8 @@ function csrfToken() {
   return match ? match[1] : null;
 }
 
-async function request(method, path, payload) {
-  const headers = {};
+async function request(method, path, payload, extraHeaders) {
+  const headers = { ...extraHeaders };
   if (payload) headers['Content-Type'] = 'application/json';
   if (method !== 'GET') {
     const token = csrfToken();
@@ -35,6 +35,10 @@ async function request(method, path, payload) {
     cache: 'no-store',
     body: payload ? JSON.stringify(payload) : undefined,
   });
+  if (response.status === 401) {
+    window.location.href = '/login.html';
+    return new Promise(() => {});
+  }
   if (response.status === 204) return null;
   const text = await response.text();
   if (!response.ok) {
@@ -48,7 +52,9 @@ async function request(method, path, payload) {
 
 function timeAgo(iso) {
   if (!iso) return 'Never';
-  const seconds = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  const ts = new Date(iso).getTime();
+  if (Number.isNaN(ts)) return 'Never';
+  const seconds = Math.max(0, (Date.now() - ts) / 1000);
   if (seconds < 60) return 'Just now';
   for (const [size, unit] of [[86400, 'day'], [3600, 'hour'], [60, 'minute']]) {
     if (seconds >= size) {
@@ -56,40 +62,45 @@ function timeAgo(iso) {
       return `${count} ${unit}${count === 1 ? '' : 's'} ago`;
     }
   }
+  return 'Just now';
 }
 
 // ── Dialogs ──
 
 const showSheet = id => pick('#' + id).classList.remove('is-hidden');
-const hideSheet = id => pick('#' + id).classList.add('is-hidden');
+function closeOverlay(overlay) {
+  overlay.classList.add('is-hidden');
+  if (overlay.id === 'sheet-install') pick('#install-command').textContent = '';
+}
+const hideSheet = id => closeOverlay(pick('#' + id));
 
 pickAll('.overlay').forEach(overlay => {
   // Backdrop clicks close; clicks inside the dialog do not.
   overlay.addEventListener('click', event => {
-    if (event.target === overlay) overlay.classList.add('is-hidden');
+    if (event.target === overlay) closeOverlay(overlay);
   });
 });
 pickAll('.sheet-close, [data-close]').forEach(button =>
-  button.addEventListener('click', () => button.closest('.overlay').classList.add('is-hidden')));
+  button.addEventListener('click', () => closeOverlay(button.closest('.overlay'))));
 document.addEventListener('keydown', event => {
-  if (event.key === 'Escape') pickAll('.overlay').forEach(o => o.classList.add('is-hidden'));
+  if (event.key === 'Escape') pickAll('.overlay').forEach(closeOverlay);
 });
 
 // ── Data ──
 
-async function refresh() {
+async function refresh(passive = false) {
+  const headers = passive ? { 'X-Passive-Poll': '1' } : undefined;
   try {
     const [connectors, routes] = await Promise.all([
-      request('GET', '/connectors'),
-      request('GET', '/resources'),
+      request('GET', '/connectors', undefined, headers),
+      request('GET', '/resources', undefined, headers),
     ]);
     state.connectors = connectors || [];
     state.routes = routes || [];
     drawConnectors();
     drawRoutes();
     return true;
-  } catch (error) {
-    if (error?.status === 401) window.location.href = '/login.html';
+  } catch {
     return false;
   }
 }
@@ -165,13 +176,19 @@ function presentInstallCommand(command) {
 
 pick('#copy-install').addEventListener('click', event => {
   const command = pick('#install-command').textContent.trim();
+  if (!navigator.clipboard?.writeText) {
+    event.target.textContent = 'Copy failed';
+    return;
+  }
   navigator.clipboard.writeText(command).then(
     () => { event.target.textContent = 'Copied'; },
     () => { event.target.textContent = 'Copy failed'; });
 });
 
-pick('#rotate-token').addEventListener('click', async () => {
+pick('#rotate-token').addEventListener('click', async event => {
   if (!confirm('Regenerate the token? The connector disconnects until it is reinstalled with the new command.')) return;
+  const button = event.currentTarget;
+  button.disabled = true;
   try {
     const issued = await request('POST', '/connectors/' + state.connectorId + '/token');
     hideSheet('sheet-connector');
@@ -179,22 +196,28 @@ pick('#rotate-token').addEventListener('click', async () => {
     refresh();
   } catch (error) {
     alert('Failed: ' + error.message);
+  } finally {
+    button.disabled = false;
   }
 });
 
-pick('#remove-connector').addEventListener('click', async () => {
+pick('#remove-connector').addEventListener('click', async event => {
   const inUse = state.routes.filter(r => r.connector_id === state.connectorId);
   if (inUse.length) {
     alert('Still used by ' + inUse.map(r => r.subdomain).join(', ') + '. Move or delete those routes first.');
     return;
   }
   if (!confirm('Delete this connector?')) return;
+  const button = event.currentTarget;
+  button.disabled = true;
   try {
     await request('DELETE', '/connectors/' + state.connectorId);
     hideSheet('sheet-connector');
     refresh();
   } catch (error) {
     alert('Failed: ' + error.message);
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -356,18 +379,22 @@ pick('#route-form').addEventListener('submit', async event => {
   }
 });
 
-pick('#remove-route').addEventListener('click', async () => {
+pick('#remove-route').addEventListener('click', async event => {
   if (!confirm('Delete this route?')) return;
+  const button = event.currentTarget;
+  button.disabled = true;
   try {
     await request('DELETE', '/resources/' + state.routeId);
     hideSheet('sheet-route');
     refresh();
   } catch (error) {
     alert('Failed: ' + error.message);
+  } finally {
+    button.disabled = false;
   }
 });
 
 // ── Start ──
 
 refresh().then(ok => { if (!ok) window.location.href = '/login.html'; });
-setInterval(refresh, 30000);
+setInterval(() => refresh(true), 30000);

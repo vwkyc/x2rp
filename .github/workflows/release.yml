@@ -24,6 +24,7 @@ jobs:
           [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "tag $GITHUB_REF_NAME, Cargo.toml says $version"; exit 1; }
       - run: rustup update stable --no-self-update
       - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   build:
     strategy:
@@ -85,6 +86,7 @@ jobs:
           url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
           for script in install.sh install-connector.sh; do
             sed "s|@RELEASE_URL@|$url|" "scripts/$script" > "dist/$script"
+            chmod +x "dist/$script"
           done
           cd dist
           sha256sum -- * > SHA256SUMS

@@ -9,7 +9,7 @@ use x2rp_proto::ssrf::{is_local_direct_target_ip, is_strictly_dangerous_ip};
 
 use crate::proxy::{ADMIN_API_PORT, DNS_LOOKUP_TIMEOUT, ProxyResource};
 
-use super::{GlobalState, Resource, is_valid_host, is_valid_label, random_hex, verify_admin};
+use super::{GlobalState, Resource, is_valid_label, random_hex, verify_admin, verify_admin_read};
 
 /// Present-or-absent double option: missing → None, null → Some(None), value → Some(Some(v)).
 /// Lets JSON `null` clear an optional field on update.
@@ -103,42 +103,13 @@ fn check_ssrf_strict(host: &str) -> Result<(), &'static str> {
     }
 }
 
-/// `http(s)://host[:port]` with no path or query → (unbracketed host, port, TLS).
-/// The scheme is the *parsed* one (`http`/`https` are matched case-insensitively and
-/// normalised), never the raw prefix: `HTTPS://` is still https.
-fn parse_http_target_host_port(target: &str) -> Result<(String, u16, bool), &'static str> {
-    let uri: http::Uri = target.parse().map_err(|_| "Invalid target URL")?;
-    let scheme = uri.scheme_str().ok_or("Invalid scheme")?;
-    let tls = match scheme {
-        "http" => false,
-        "https" => true,
-        _ => return Err("Invalid scheme"),
-    };
-    if let Some(path_and_query) = uri.path_and_query()
-        && (!matches!(path_and_query.path(), "" | "/") || path_and_query.query().is_some())
-    {
-        return Err("Target must not include a path or query");
-    }
-    let host = uri.host().ok_or("Missing host")?;
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
-    Ok((host.to_string(), port, tls))
-}
-
 /// Shape and SSRF gate, before any state lock is taken. Shared by create and
 /// update so the two cannot drift into admitting different origins.
 async fn validate_target(target: &str, connector_id: Option<&str>) -> Result<(), http::StatusCode> {
-    let (host, port, tls) = parse_http_target_host_port(target).map_err(|reason| {
+    let (host, port, tls) = x2rp_proto::parse_http_origin(target).map_err(|reason| {
         tracing::warn!("Invalid target {target}: {reason}");
         http::StatusCode::BAD_REQUEST
     })?;
-    if host.parse::<IpAddr>().is_err() && !is_valid_host(&host) {
-        tracing::warn!("Invalid target host: {target}");
-        return Err(http::StatusCode::BAD_REQUEST);
-    }
     // The connector opens plain TCP to the origin; TLS to it is not supported. The
     // parsed scheme, not the raw prefix, so `HTTPS://` cannot slip past this.
     if connector_id.is_some() && tls {
@@ -146,8 +117,8 @@ async fn validate_target(target: &str, connector_id: Option<&str>) -> Result<(),
         return Err(http::StatusCode::BAD_REQUEST);
     }
     let ssrf = match connector_id {
-        Some(_) => check_ssrf_strict(&host),
-        None => check_ssrf_local(&host, port).await,
+        Some(_) => check_ssrf_strict(host),
+        None => check_ssrf_local(host, port).await,
     };
     ssrf.map_err(|reason| {
         tracing::warn!("SSRF blocked for target {target}: {reason}");
@@ -169,7 +140,7 @@ pub async fn list_resources(
     State(state): State<GlobalState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<Resource>>, http::StatusCode> {
-    if !verify_admin(&state, &headers).await {
+    if !verify_admin_read(&state, &headers).await {
         return Err(http::StatusCode::UNAUTHORIZED);
     }
     Ok(Json(state.state.read().await.resources.clone()))
@@ -258,23 +229,45 @@ pub async fn update_resource(
         .map(parse_allowlist)
         .transpose()?;
 
-    let current = {
-        let s = state.state.read().await;
-        s.resources
-            .iter()
-            .find(|r| r.id == id)
-            .cloned()
-            .ok_or(http::StatusCode::NOT_FOUND)?
+    let new_connector_id = req.connector_id.map(normalize_connector_id);
+    let validated_pair = if req.target.is_some() || new_connector_id.is_some() {
+        let current = {
+            let s = state.state.read().await;
+            s.resources
+                .iter()
+                .find(|r| r.id == id)
+                .cloned()
+                .ok_or(http::StatusCode::NOT_FOUND)?
+        };
+        let candidate_target = req.target.as_deref().unwrap_or(&current.target);
+        let candidate_connector = new_connector_id
+            .as_ref()
+            .unwrap_or(&current.connector_id)
+            .as_deref();
+        validate_target(candidate_target, candidate_connector).await?;
+        Some((
+            candidate_target.to_string(),
+            candidate_connector.map(str::to_string),
+        ))
+    } else {
+        None
     };
-    let mut resource = current.clone();
+
+    let mut s = state.state.write().await;
+    let idx = s
+        .resources
+        .iter()
+        .position(|r| r.id == id)
+        .ok_or(http::StatusCode::NOT_FOUND)?;
+    let mut resource = s.resources[idx].clone();
     if let Some(subdomain) = subdomain {
         resource.subdomain = subdomain;
     }
     if let Some(target) = req.target {
         resource.target = target;
     }
-    if let Some(connector_id) = req.connector_id {
-        resource.connector_id = normalize_connector_id(connector_id);
+    if let Some(connector_id) = new_connector_id {
+        resource.connector_id = connector_id;
     }
     if let Some(enabled) = req.enabled {
         resource.enabled = enabled;
@@ -282,9 +275,12 @@ pub async fn update_resource(
     if let Some(allowlist) = allowlist {
         resource.allowed_client_cidrs = allowlist;
     }
-    validate_target(&resource.target, resource.connector_id.as_deref()).await?;
-
-    let mut s = state.state.write().await;
+    // Reject if a concurrent update changed target/connector between validation and write lock.
+    if let Some((validated_target, validated_connector)) = validated_pair
+        && (resource.target != validated_target || resource.connector_id != validated_connector)
+    {
+        return Err(http::StatusCode::CONFLICT);
+    }
     if subdomain_in_use(&s.resources, &resource.subdomain, Some(&id)) {
         return Err(http::StatusCode::CONFLICT);
     }
@@ -294,20 +290,19 @@ pub async fn update_resource(
         tracing::warn!("Resource update references unknown connector {cid}");
         return Err(http::StatusCode::BAD_REQUEST);
     }
-    let idx = s
-        .resources
-        .iter()
-        .position(|r| r.id == id)
-        .ok_or(http::StatusCode::NOT_FOUND)?;
     let old = std::mem::replace(&mut s.resources[idx], resource.clone());
     if let Err(e) = s.save() {
         s.resources[idx] = old;
         tracing::error!("Failed to save resource {}: {}", id, e);
         return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
     }
-    // Routes are keyed by subdomain: drop the old name before publishing the new one.
-    state.proxy_ctx.remove_resource(&old.subdomain);
-    publish(&state, &resource);
+    // Atomically swap the live route under one lock so edits never cause a transient 404.
+    state.proxy_ctx.replace_resource(
+        &old.subdomain,
+        resource
+            .enabled
+            .then(|| ProxyResource::from_resource(&resource)),
+    );
     tracing::info!("Updated resource: {}", id);
     Ok(Json(resource))
 }
@@ -390,6 +385,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            validate_target("http://user@127.0.0.1:8080", None)
+                .await
+                .is_err()
+        );
+        assert!(validate_target("http://127.0.0.1:0", None).await.is_err());
     }
 
     /// "Same-host reverse proxy" versus "LAN via connector". Literal IPs only (no

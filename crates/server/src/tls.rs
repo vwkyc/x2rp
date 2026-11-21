@@ -36,11 +36,28 @@ fn dns01_record_name(identifier: &Identifier, fallback_domain: &str) -> String {
     }
 }
 
-/// Days until the leaf certificate expires; `None` if it is missing or unreadable.
-fn days_until_expiry() -> Option<i64> {
+/// Days until the leaf certificate expires; `None` if it is missing, unreadable,
+/// or does not cover both `domain` and `*.domain`.
+fn days_until_expiry_for_domain(domain: &str) -> Option<i64> {
     let pem_bytes = std::fs::read(CERT_FILE).ok()?;
     let (_, pem) = x509_parser::pem::parse_x509_pem(&pem_bytes).ok()?;
     let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents).ok()?;
+    let wildcard = format!("*.{domain}");
+    let (mut has_apex, mut has_wildcard) = (false, false);
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
+                if dns.eq_ignore_ascii_case(domain) {
+                    has_apex = true;
+                } else if dns.eq_ignore_ascii_case(&wildcard) {
+                    has_wildcard = true;
+                }
+            }
+        }
+    }
+    if !has_apex || !has_wildcard {
+        return None;
+    }
     Some((cert.validity().not_after.timestamp() - chrono::Utc::now().timestamp()) / 86400)
 }
 
@@ -53,15 +70,20 @@ impl CertManager {
     }
 
     /// Obtain or renew via Let's Encrypt when the certificate or its key is missing,
-    /// or it expires within [`RENEWAL_THRESHOLD_DAYS`]. `Ok(true)` when it did.
+    /// mismatched, does not cover `domain` + `*.domain`, or expires within
+    /// [`RENEWAL_THRESHOLD_DAYS`]. `Ok(true)` when it did.
     pub async fn ensure_certs(&self) -> anyhow::Result<bool> {
-        match days_until_expiry() {
-            Some(days) if days >= RENEWAL_THRESHOLD_DAYS && Path::new(KEY_FILE).exists() => {
+        let key_ok = load_certified_key(Path::new(CERT_FILE), Path::new(KEY_FILE)).is_ok();
+        match days_until_expiry_for_domain(&self.domain) {
+            Some(days) if days >= RENEWAL_THRESHOLD_DAYS && key_ok => {
                 tracing::info!("TLS certificate valid ({days} days until expiry)");
                 return Ok(false);
             }
-            Some(_) => tracing::info!("TLS certificate expiring soon, renewing..."),
-            None => tracing::info!("No TLS certificate found, obtaining from Let's Encrypt..."),
+            Some(_) if key_ok => tracing::info!("TLS certificate expiring soon, renewing..."),
+            _ => tracing::info!(
+                "No valid TLS certificate/key for {}, obtaining from Let's Encrypt...",
+                self.domain
+            ),
         }
         self.obtain_certificate().await?;
         Ok(true)
@@ -78,7 +100,7 @@ impl CertManager {
             .await
             .context("Failed to create ACME order")?;
 
-        let cf = CloudflareDns::new(&self.cf_api_token);
+        let cf = CloudflareDns::new(&self.cf_api_token)?;
         let zone_id = cf
             .find_zone_id(&self.domain)
             .await
@@ -130,7 +152,10 @@ impl CertManager {
                 .challenge(ChallengeType::Dns01)
                 .context("No DNS-01 challenge in authorization")?;
             let dns_value = challenge.key_authorization().dns_value();
-            tracing::info!("Creating DNS TXT: {record_name} = {}…", &dns_value[..8]);
+            tracing::info!(
+                "Creating DNS TXT: {record_name} = {}…",
+                dns_value.get(..8).unwrap_or(&dns_value)
+            );
             record_ids.push(
                 cf.create_txt_record(zone_id, &record_name, &dns_value)
                     .await?,
@@ -185,10 +210,13 @@ impl CertManager {
 
 async fn load_or_create_account() -> anyhow::Result<Account> {
     let path = Path::new(ACME_ACCOUNT_FILE);
-    if path.exists() {
-        let creds: AccountCredentials =
-            serde_json::from_slice(&x2rp_proto::read_secret_file(path, 0o600)?)?;
-        return Ok(Account::builder()?.from_credentials(creds).await?);
+    match x2rp_proto::read_secret_file(path, 0o600) {
+        Ok(bytes) => {
+            let creds: AccountCredentials = serde_json::from_slice(&bytes)?;
+            return Ok(Account::builder()?.from_credentials(creds).await?);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
 
     tracing::info!("Creating new ACME account...");
@@ -209,24 +237,39 @@ async fn load_or_create_account() -> anyhow::Result<Account> {
 
 // ── Cloudflare DNS API ──────────────────────────────────────────────────────
 
+type HttpsClient = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    http_body_util::Full<bytes::Bytes>,
+>;
+
+const CF_API: &str = "https://api.cloudflare.com/client/v4/zones";
+const CF_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CF_RESPONSE_BYTES: usize = 256 * 1024;
+
 struct CloudflareDns {
     api_token: String,
-    client: reqwest::Client,
+    client: HttpsClient,
 }
 
 #[derive(Deserialize)]
 struct CfResponse<T> {
     success: bool,
-    result: T,
+    result: Option<T>,
+    #[serde(default)]
     errors: Vec<CfError>,
 }
 
 impl<T> CfResponse<T> {
     fn into_result(self, context: &str) -> anyhow::Result<T> {
-        if self.success {
-            return Ok(self.result);
+        if self.success
+            && let Some(result) = self.result
+        {
+            return Ok(result);
         }
         let msgs: Vec<&str> = self.errors.iter().map(|e| e.message.as_str()).collect();
+        if msgs.is_empty() {
+            bail!("{context}: unexpected empty response");
+        }
         bail!("{}: {}", context, msgs.join(", "));
     }
 }
@@ -241,39 +284,88 @@ struct CfId {
     id: String,
 }
 
-const CF_API: &str = "https://api.cloudflare.com/client/v4/zones";
-
 impl CloudflareDns {
-    fn new(api_token: &str) -> Self {
-        Self {
+    fn new(api_token: &str) -> anyhow::Result<Self> {
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .context("failed to load native root certificates")?
+            .https_only()
+            .enable_http1()
+            .build();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(https);
+        Ok(Self {
             api_token: api_token.to_string(),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("failed to build HTTP client"),
+            client,
+        })
+    }
+
+    async fn request(
+        &self,
+        method: http::Method,
+        url: &str,
+        body: Option<bytes::Bytes>,
+    ) -> anyhow::Result<(http::StatusCode, bytes::Bytes)> {
+        use http_body_util::{BodyExt, Full, Limited};
+
+        let mut builder = http::Request::builder().method(method).uri(url).header(
+            http::header::AUTHORIZATION,
+            format!("Bearer {}", self.api_token),
+        );
+        if body.is_some() {
+            builder = builder.header(http::header::CONTENT_TYPE, "application/json");
         }
+        let req = builder.body(Full::new(body.unwrap_or_default()))?;
+        let resp = tokio::time::timeout(CF_TIMEOUT, self.client.request(req))
+            .await
+            .context("Cloudflare API request timed out")??;
+        let status = resp.status();
+        let bytes = tokio::time::timeout(
+            CF_TIMEOUT,
+            Limited::new(resp.into_body(), MAX_CF_RESPONSE_BYTES).collect(),
+        )
+        .await
+        .context("Cloudflare API response read timed out")?
+        .map_err(|e| anyhow::anyhow!("Cloudflare API response error: {e}"))?
+        .to_bytes();
+        Ok((status, bytes))
     }
 
     async fn find_zone_id(&self, domain: &str) -> anyhow::Result<String> {
-        let resp: CfResponse<Vec<CfId>> = self
-            .client
-            // The domain passed `is_valid_domain` at setup: nothing to escape.
-            .get(format!("{CF_API}?name={domain}"))
-            .bearer_auth(&self.api_token)
-            .send()
-            .await
-            .context("Cloudflare API request failed")?
-            .json()
-            .await
-            .context("Invalid Cloudflare API response")?;
+        // Walk from full domain up to the registrable parent zone (e.g. sub.example.com -> example.com).
+        let mut candidate = domain.trim_end_matches('.');
+        loop {
+            if !crate::api::is_valid_domain(candidate) {
+                break;
+            }
+            // `candidate` passed `is_valid_domain` (ASCII alphanumeric, `-`, `.`): nothing to escape.
+            let (status, body) = self
+                .request(
+                    http::Method::GET,
+                    &format!("{CF_API}?name={candidate}"),
+                    None,
+                )
+                .await?;
+            let resp: CfResponse<Vec<CfId>> = serde_json::from_slice(&body)
+                .with_context(|| format!("Invalid Cloudflare API response (HTTP {status})"))?;
 
-        resp.into_result("Cloudflare zone lookup failed")?
-            .into_iter()
-            .next()
-            .map(|zone| zone.id)
-            .with_context(|| {
-                format!("No Cloudflare zone found for '{domain}', check your API token permissions")
-            })
+            if let Some(zone) = resp
+                .into_result("Cloudflare zone lookup failed")?
+                .into_iter()
+                .next()
+            {
+                return Ok(zone.id);
+            }
+            let Some((_, parent)) = candidate.split_once('.') else {
+                break;
+            };
+            if !parent.contains('.') {
+                break;
+            }
+            candidate = parent;
+        }
+        bail!("No Cloudflare zone found for '{domain}', check your API token permissions")
     }
 
     async fn create_txt_record(
@@ -282,30 +374,35 @@ impl CloudflareDns {
         name: &str,
         content: &str,
     ) -> anyhow::Result<String> {
-        let resp: CfResponse<CfId> = self
-            .client
-            .post(format!("{CF_API}/{zone_id}/dns_records"))
-            .bearer_auth(&self.api_token)
-            .json(&serde_json::json!({
-                "type": "TXT",
-                "name": name,
-                "content": content,
-                "ttl": 120
-            }))
-            .send()
-            .await?
-            .json()
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "type": "TXT",
+            "name": name,
+            "content": content,
+            "ttl": 120
+        }))?;
+        let (status, body) = self
+            .request(
+                http::Method::POST,
+                &format!("{CF_API}/{zone_id}/dns_records"),
+                Some(payload.into()),
+            )
             .await?;
+        let resp: CfResponse<CfId> = serde_json::from_slice(&body)
+            .with_context(|| format!("Invalid Cloudflare create TXT response (HTTP {status})"))?;
         Ok(resp.into_result("Failed to create TXT record")?.id)
     }
 
     async fn delete_txt_record(&self, zone_id: &str, record_id: &str) -> anyhow::Result<()> {
-        self.client
-            .delete(format!("{CF_API}/{zone_id}/dns_records/{record_id}"))
-            .bearer_auth(&self.api_token)
-            .send()
-            .await?
-            .error_for_status()?;
+        let (status, _) = self
+            .request(
+                http::Method::DELETE,
+                &format!("{CF_API}/{zone_id}/dns_records/{record_id}"),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            bail!("Cloudflare delete TXT record failed: HTTP {status}");
+        }
         Ok(())
     }
 }
@@ -316,16 +413,22 @@ impl CloudflareDns {
 pub struct CertStore {
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
+    allowed_domain: String,
     current: parking_lot::RwLock<std::sync::Arc<rustls::sign::CertifiedKey>>,
 }
 
 impl CertStore {
-    pub fn load(cert_path: &str, key_path: &str) -> anyhow::Result<std::sync::Arc<Self>> {
+    pub fn load(
+        cert_path: &str,
+        key_path: &str,
+        allowed_domain: impl Into<String>,
+    ) -> anyhow::Result<std::sync::Arc<Self>> {
         let (cert_path, key_path) = (Path::new(cert_path), Path::new(key_path));
         let current = load_certified_key(cert_path, key_path)?;
         Ok(std::sync::Arc::new(Self {
             cert_path: cert_path.to_path_buf(),
             key_path: key_path.to_path_buf(),
+            allowed_domain: allowed_domain.into().trim().to_ascii_lowercase(),
             current: parking_lot::RwLock::new(std::sync::Arc::new(current)),
         }))
     }
@@ -341,14 +444,35 @@ impl CertStore {
     pub fn current(&self) -> std::sync::Arc<rustls::sign::CertifiedKey> {
         self.current.read().clone()
     }
+
+    /// True when `sni` is the configured apex domain or a single-label subdomain
+    /// covered by the `*.domain` wildcard certificate.
+    fn allows_sni(&self, sni: &str) -> bool {
+        if self.allowed_domain.is_empty() {
+            return false;
+        }
+        if sni.eq_ignore_ascii_case(&self.allowed_domain) {
+            return true;
+        }
+        let Some(prefix_len) = sni.len().checked_sub(self.allowed_domain.len() + 1) else {
+            return false;
+        };
+        prefix_len > 0
+            && sni.as_bytes()[prefix_len] == b'.'
+            && sni[prefix_len + 1..].eq_ignore_ascii_case(&self.allowed_domain)
+            && !sni[..prefix_len].contains('.')
+    }
 }
 
 impl rustls::server::ResolvesServerCert for CertStore {
     fn resolve(
         &self,
-        _hello: rustls::server::ClientHello<'_>,
+        hello: rustls::server::ClientHello<'_>,
     ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
-        Some(self.current())
+        // Refuse handshakes with missing or non-matching SNI so raw-IP scanners
+        // cannot discover the configured domain from the wildcard certificate.
+        let sni = hello.server_name()?;
+        self.allows_sni(sni).then(|| self.current())
     }
 }
 
@@ -403,8 +527,17 @@ mod tests {
         };
 
         let first = write("old.example");
-        let store = CertStore::load(cert.to_str().unwrap(), key.to_str().unwrap()).expect("load");
+        let store = CertStore::load(cert.to_str().unwrap(), key.to_str().unwrap(), "example.com")
+            .expect("load");
         assert_eq!(store.current().cert[0], first);
+
+        assert!(store.allows_sni("example.com"));
+        assert!(store.allows_sni("app.example.com"));
+        assert!(store.allows_sni("APP.EXAMPLE.COM"));
+        assert!(!store.allows_sni("a.b.example.com"));
+        assert!(!store.allows_sni("other.com"));
+        assert!(!store.allows_sni(".example.com"));
+        assert!(!store.allows_sni("notexample.com"));
 
         let second = write("new.example");
         store.reload().expect("reload");

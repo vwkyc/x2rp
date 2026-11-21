@@ -6,7 +6,9 @@ use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
-use super::{Connector, GlobalState, bearer_token, hash_token, random_hex, verify_admin};
+use super::{
+    Connector, GlobalState, bearer_token, hash_token, random_hex, verify_admin, verify_admin_read,
+};
 
 /// The one-shot install command the admin UI shows with a new token. A release
 /// build knows the repository it was published from (`X2RP_REPO`, set by the
@@ -27,7 +29,7 @@ pub async fn list_connectors(
     State(state): State<GlobalState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ConnectorDetail>>, http::StatusCode> {
-    if !verify_admin(&state, &headers).await {
+    if !verify_admin_read(&state, &headers).await {
         return Err(http::StatusCode::UNAUTHORIZED);
     }
     let s = state.state.read().await;
@@ -136,25 +138,29 @@ pub async fn update_connector(
     if !verify_admin(&state, &headers).await {
         return Err(http::StatusCode::UNAUTHORIZED);
     }
-    let mut s = state.state.write().await;
-    let connector = s
-        .connectors
-        .get_mut(&id)
-        .ok_or(http::StatusCode::NOT_FOUND)?;
-    let changed = connector.force_wss != req.force_wss;
-    connector.force_wss = req.force_wss;
+    let (changed, connector) = {
+        let mut s = state.state.write().await;
+        let connector = s
+            .connectors
+            .get_mut(&id)
+            .ok_or(http::StatusCode::NOT_FOUND)?;
+        let changed = connector.force_wss != req.force_wss;
+        connector.force_wss = req.force_wss;
+        let snapshot = connector.clone();
 
-    if changed {
-        if let Err(e) = s.save() {
-            tracing::warn!("Failed to persist force_wss for {id}: {e}; applies until restart");
+        if changed {
+            if let Err(e) = s.save() {
+                tracing::warn!("Failed to persist force_wss for {id}: {e}; applies until restart");
+            }
+            tracing::info!("Connector {} force_wss set to {}", id, req.force_wss);
         }
-        tracing::info!("Connector {} force_wss set to {}", id, req.force_wss);
+        (changed, snapshot)
+    };
+    if changed {
         state.proxy_ctx.connectors.unregister(&id);
     }
 
-    // Built from the still-held write guard, so a concurrent delete can't turn a
-    // successful update into a misleading 404.
-    Ok(Json(connector_detail(&s.connectors[&id], &state)))
+    Ok(Json(connector_detail(&connector, &state)))
 }
 
 /// POST /api/connector/disconnect: a connector ending its own session.
@@ -211,6 +217,7 @@ pub async fn delete_connector(
         tracing::error!("Failed to save connector deletion {}: {}", id, e);
         return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
     }
+    drop(s);
     // Only after the save: a failed delete must not leave the connector cut off.
     state.proxy_ctx.connectors.unregister(&id);
     Ok(http::StatusCode::NO_CONTENT)

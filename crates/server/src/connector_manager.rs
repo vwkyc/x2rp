@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -20,6 +20,9 @@ use x2rp_proto::{
 /// Budget to open a tunnel: stream open, `Connect`, and the connector's backend
 /// connect answered by `ConnectOk` / `ConnectErr`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-stream message cap: prevents tiny-chunk floods from accumulating unbounded
+/// queue nodes inside a single `STREAM_RECV_WINDOW`.
+const STREAM_QUEUE_CAPACITY: usize = 4096;
 
 /// How the session reaches its connector.
 pub enum Link {
@@ -30,10 +33,9 @@ pub enum Link {
 
 /// Active WSS mux stream.
 struct ActiveStream {
-    /// Sends payloads to the downstream writer. Unbounded: the connector's
-    /// download sender is credit-gated to [`STREAM_RECV_WINDOW`], enforced via
-    /// `recv_outstanding`, so queued bytes stay within one window.
-    to_socket: mpsc::UnboundedSender<Bytes>,
+    /// Sends payloads to the downstream writer. Bounded in both bytes (`recv_outstanding`
+    /// <= `STREAM_RECV_WINDOW`) and chunk count (`STREAM_QUEUE_CAPACITY`).
+    to_socket: mpsc::Sender<Bytes>,
     /// Upload (client → connector) send credit; replenished by connector
     /// `WindowUpdate`s. Closed on teardown so the upload never leaks.
     send_credit: Arc<SendCredit>,
@@ -45,6 +47,7 @@ struct ActiveStream {
 pub struct ConnectorManager {
     connector_id: String,
     link: Link,
+    closed: AtomicBool,
     active_streams: AtomicU32,
     shutdown_notify: Arc<tokio::sync::Notify>,
     // WSS mux state.
@@ -59,6 +62,7 @@ impl ConnectorManager {
         Self {
             connector_id,
             link,
+            closed: AtomicBool::new(false),
             active_streams: AtomicU32::new(0),
             shutdown_notify: Arc::default(),
             next_stream_id: AtomicU32::new(1),
@@ -80,6 +84,7 @@ impl ConnectorManager {
 
     /// End the session: QUIC closes the connection, the WSS writer watches the notify.
     pub fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
         if let Link::Quic(connection) = &self.link {
             connection.close(0u32.into(), b"shutdown");
         }
@@ -95,6 +100,9 @@ impl ConnectorManager {
     }
 
     fn try_reserve_stream_slot(&self) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
         let limit = MAX_ACTIVE_STREAMS as u32;
         self.active_streams
             .try_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
@@ -128,6 +136,23 @@ impl ConnectorManager {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        self.bridge_cancellable(target, stream, None)
+    }
+
+    /// Bridge a connection stream to the connector, aborting the tunnel immediately
+    /// when `cancel` resolves (e.g. Pingora drops its end of `RelayPipe`).
+    pub fn bridge_cancellable<S>(
+        self: &Arc<Self>,
+        target: &str,
+        stream: S,
+        cancel: Option<oneshot::Receiver<()>>,
+    ) -> Result<(), String>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        if self.closed.load(Ordering::Acquire) {
+            return Err("connector disconnected".to_string());
+        }
         if !self.try_reserve_stream_slot() {
             return Err(format!(
                 "connector overloaded: active stream cap ({MAX_ACTIVE_STREAMS}) reached"
@@ -137,19 +162,24 @@ impl ConnectorManager {
         tokio::spawn(async move {
             match &this.link {
                 Link::Quic(connection) => {
-                    if let Err(e) = quic_tunnel(connection, target, stream).await {
+                    if let Err(e) = quic_tunnel(connection, target, stream, cancel).await {
                         warn!("QUIC tunnel for {}: {e}", this.connector_id);
                     }
                     this.release_stream_slot();
                 }
-                Link::Wss(tx) => this.wss_tunnel(tx, stream, target).await,
+                Link::Wss(tx) => this.wss_tunnel(tx, stream, target, cancel).await,
             }
         });
         Ok(())
     }
 
-    async fn wss_tunnel<S>(&self, tx: &mpsc::Sender<Message>, stream: S, target: String)
-    where
+    async fn wss_tunnel<S>(
+        &self,
+        tx: &mpsc::Sender<Message>,
+        stream: S,
+        target: String,
+        cancel: Option<oneshot::Receiver<()>>,
+    ) where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         // Skip ids still in use (the counter wraps after ~4 billion streams).
@@ -162,7 +192,7 @@ impl ConnectorManager {
 
         // Register the download channel before Connect: Data can race ahead of ConnectOk.
         let (response_tx, response_rx) = oneshot::channel();
-        let (to_socket_tx, mut to_socket_rx) = mpsc::unbounded_channel();
+        let (to_socket_tx, mut to_socket_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
         let send_credit = Arc::new(SendCredit::new(STREAM_RECV_WINDOW));
         let recv_outstanding = Arc::new(AtomicUsize::new(0));
         self.pending.write().insert(stream_id, response_tx);
@@ -174,6 +204,21 @@ impl ConnectorManager {
                 recv_outstanding: recv_outstanding.clone(),
             },
         );
+        if self.closed.load(Ordering::Acquire) {
+            self.remove_stream(stream_id);
+            return;
+        }
+
+        // Resolves once the caller drops its pipe handle; pending forever if no cancel was given.
+        let cancelled = async move {
+            match cancel {
+                Some(rx) => {
+                    let _ = rx.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(cancelled);
 
         // Bounded, so a full channel cannot park this bridge forever.
         let connect = Message::Connect { stream_id, target };
@@ -184,20 +229,28 @@ impl ConnectorManager {
             return;
         }
 
-        let failure = match tokio::time::timeout(CONNECT_TIMEOUT, response_rx).await {
-            Ok(Ok(Ok(()))) => None,
-            Ok(Ok(Err(e))) => Some(format!("connection failed: {e}")),
-            Ok(Err(_)) => Some("connection cancelled".to_string()),
-            Err(_) => Some(format!(
-                "connection timed out ({}s)",
-                CONNECT_TIMEOUT.as_secs()
-            )),
+        let failure = tokio::select! {
+            biased;
+            () = &mut cancelled => Some("downstream closed before connect".to_string()),
+            res = tokio::time::timeout(CONNECT_TIMEOUT, response_rx) => match res {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(e))) => Some(format!("connection failed: {e}")),
+                Ok(Err(_)) => Some("connection cancelled".to_string()),
+                Err(_) => Some(format!(
+                    "connection timed out ({}s)",
+                    CONNECT_TIMEOUT.as_secs()
+                )),
+            },
         };
         if let Some(reason) = failure {
             warn!("Stream {stream_id} {reason}");
             self.remove_stream(stream_id);
             // A connect that lands after we gave up must not leave a backend open.
-            let _ = tx.send(Message::Reset { stream_id }).await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                tx.send(Message::Reset { stream_id }),
+            )
+            .await;
             return;
         }
 
@@ -206,7 +259,9 @@ impl ConnectorManager {
         let upload = async {
             let mut buf = BytesMut::with_capacity(TUNNEL_READ_CHUNK);
             loop {
-                buf.reserve(TUNNEL_READ_CHUNK);
+                if buf.capacity() < 4096 {
+                    buf.reserve(TUNNEL_READ_CHUNK);
+                }
                 match rd.read_buf(&mut buf).await {
                     // Request EOF: the connector half-closes the backend and still streams the response.
                     Ok(0) => {
@@ -263,13 +318,26 @@ impl ConnectorManager {
             }
         };
 
-        // The stream ends with the download; a finished upload only half-closes.
+        // The stream ends with the download or downstream drop; a finished upload only half-closes.
         tokio::pin!(download);
-        tokio::select! {
-            () = &mut download => {}
-            () = upload => download.await,
-        }
+        let aborted = tokio::select! {
+            biased;
+            () = &mut cancelled => true,
+            () = &mut download => false,
+            () = upload => tokio::select! {
+                biased;
+                () = &mut cancelled => true,
+                () = &mut download => false,
+            },
+        };
         self.remove_stream(stream_id);
+        if aborted {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                tx.send(Message::Reset { stream_id }),
+            )
+            .await;
+        }
     }
 
     /// Called by the WSS read loop; never blocks it.
@@ -296,19 +364,37 @@ impl ConnectorManager {
                 };
                 let len = payload.len();
                 let after = outstanding.fetch_add(len, Ordering::AcqRel) + len;
-                if after > STREAM_RECV_WINDOW {
-                    warn!(
-                        "Stream {stream_id} exceeded flow-control window ({after} > {STREAM_RECV_WINDOW}), resetting"
-                    );
+                let reset_reason = if after > STREAM_RECV_WINDOW {
+                    Some(format!(
+                        "exceeded flow-control window ({after} > {STREAM_RECV_WINDOW})"
+                    ))
+                } else {
+                    match sender.try_send(payload) {
+                        Ok(()) => None,
+                        Err(mpsc::error::TrySendError::Full(_)) => Some(format!(
+                            "exceeded message queue cap ({STREAM_QUEUE_CAPACITY})"
+                        )),
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            self.remove_stream(stream_id);
+                            return;
+                        }
+                    }
+                };
+                if let Some(reason) = reset_reason {
+                    warn!("Stream {stream_id} {reason}, resetting");
                     self.remove_stream(stream_id);
-                    if let Link::Wss(tx) = &self.link {
+                    if let Link::Wss(tx) = &self.link
+                        && tx.try_send(Message::Reset { stream_id }).is_err()
+                    {
                         let tx = tx.clone();
                         tokio::spawn(async move {
-                            let _ = tx.send(Message::Reset { stream_id }).await;
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                tx.send(Message::Reset { stream_id }),
+                            )
+                            .await;
                         });
                     }
-                } else if sender.send(payload).is_err() {
-                    self.remove_stream(stream_id);
                 }
             }
             // Connector drained upload bytes: replenish that stream's send credit.
@@ -327,15 +413,26 @@ impl ConnectorManager {
 }
 
 /// One QUIC tunnel: `Connect` out, `ConnectOk` / `ConnectErr` back, then a splice.
-/// Dropping the streams on a failure closes the tunnel on the connector too.
+/// Dropping the streams (or cancelling via `RelayPipe::drop`) resets the tunnel immediately.
 async fn quic_tunnel<S>(
     connection: &quinn::Connection,
     target: String,
     mut stream: S,
+    cancel: Option<oneshot::Receiver<()>>,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let cancelled = async move {
+        match cancel {
+            Some(rx) => {
+                let _ = rx.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(cancelled);
+
     let open = async {
         let (mut send, mut recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
         let stream_id = send.id().index() as u32;
@@ -349,20 +446,36 @@ where
             other => Err(format!("unexpected {other:?}")),
         }
     };
-    let (send, recv) = tokio::time::timeout(CONNECT_TIMEOUT, open)
-        .await
-        .map_err(|_| format!("connection timed out ({}s)", CONNECT_TIMEOUT.as_secs()))??;
+    let (mut send, mut recv) = tokio::select! {
+        biased;
+        () = &mut cancelled => return Ok(()),
+        res = tokio::time::timeout(CONNECT_TIMEOUT, open) => {
+            res.map_err(|_| format!("connection timed out ({}s)", CONNECT_TIMEOUT.as_secs()))??
+        }
+    };
     // TUNNEL_READ_CHUNK, as the WSS pumps read: tokio's 8 KiB default means four
     // times the stream writes, each taking the connection's lock.
-    if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
-        &mut stream,
-        &mut tokio::io::join(recv, send),
-        TUNNEL_READ_CHUNK,
-        TUNNEL_READ_CHUNK,
-    )
-    .await
-    {
-        debug!("QUIC tunnel ended: {e}");
+    let aborted = {
+        let mut joined = tokio::io::join(&mut recv, &mut send);
+        tokio::select! {
+            biased;
+            () = &mut cancelled => true,
+            res = tokio::io::copy_bidirectional_with_sizes(
+                &mut stream,
+                &mut joined,
+                TUNNEL_READ_CHUNK,
+                TUNNEL_READ_CHUNK,
+            ) => {
+                if let Err(e) = res {
+                    debug!("QUIC tunnel ended: {e}");
+                }
+                false
+            }
+        }
+    };
+    if aborted {
+        let _ = send.reset(0u32.into());
+        let _ = recv.stop(0u32.into());
     }
     Ok(())
 }
@@ -374,33 +487,57 @@ pub struct ConnectorRegistry {
 
 impl ConnectorRegistry {
     pub fn register(&self, manager: Arc<ConnectorManager>) {
-        let replaced = self
-            .managers
-            .write()
-            .insert(manager.connector_id.clone(), manager.clone());
+        self.try_register(manager, usize::MAX);
+    }
+
+    /// True if `connector_id` can be registered without exceeding `max_sessions`
+    /// (replacing an already-connected session for the same ID is always allowed).
+    pub fn can_register(&self, connector_id: &str, max_sessions: usize) -> bool {
+        let map = self.managers.read();
+        map.contains_key(connector_id) || map.len() < max_sessions
+    }
+
+    /// Register a connector session, enforcing `max_sessions` for new distinct IDs
+    /// while always allowing a reconnecting connector to replace its own stale session.
+    pub fn try_register(&self, manager: Arc<ConnectorManager>, max_sessions: usize) -> bool {
+        let replaced = {
+            let mut map = self.managers.write();
+            if !map.contains_key(&manager.connector_id) && map.len() >= max_sessions {
+                return false;
+            }
+            map.insert(manager.connector_id.clone(), manager.clone())
+        };
         if let Some(previous) = replaced
             && !Arc::ptr_eq(&previous, &manager)
         {
             previous.shutdown();
         }
+        true
     }
 
     /// Unregister on disconnect, only if it is still this instance and never a
     /// newly reconnected replacement.
     pub fn unregister_manager(&self, manager: &Arc<ConnectorManager>) {
-        let mut map = self.managers.write();
-        if map
-            .get(&manager.connector_id)
-            .is_some_and(|registered| Arc::ptr_eq(registered, manager))
-        {
-            map.remove(&manager.connector_id);
-            manager.shutdown();
+        let removed = {
+            let mut map = self.managers.write();
+            if map
+                .get(&manager.connector_id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, manager))
+            {
+                map.remove(&manager.connector_id)
+            } else {
+                None
+            }
+        };
+        if let Some(removed) = removed {
+            removed.shutdown();
         }
     }
 
     /// Force-disconnect a connector by ID (used when deleting or reconfiguring)
     pub fn unregister(&self, connector_id: &str) {
-        if let Some(manager) = self.managers.write().remove(connector_id) {
+        let removed = self.managers.write().remove(connector_id);
+        if let Some(manager) = removed {
             manager.shutdown();
         }
     }
@@ -650,6 +787,29 @@ mod tests {
         registry.register(old_manager);
         registry.unregister("same-id");
         assert!(registry.get("same-id").is_none());
+    }
+
+    #[test]
+    fn try_register_allows_reconnecting_connector_to_replace_at_capacity() {
+        let make = |id: &str| {
+            let (tx, _rx) = mpsc::channel(2);
+            Arc::new(ConnectorManager::new(id.to_string(), Link::Wss(tx)))
+        };
+        let registry = ConnectorRegistry::default();
+        let first_a = make("a");
+        assert!(registry.try_register(first_a.clone(), 2));
+        assert!(registry.try_register(make("b"), 2));
+        assert!(
+            !registry.try_register(make("c"), 2),
+            "third distinct ID rejected"
+        );
+
+        let second_a = make("a");
+        assert!(
+            registry.try_register(second_a.clone(), 2),
+            "reconnecting ID replaces its own slot even at capacity"
+        );
+        assert!(Arc::ptr_eq(&registry.get("a").unwrap(), &second_a));
     }
 
     /// Over QUIC a tunnel is `Connect`, `ConnectOk`, then raw bytes on its own stream.

@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use dashmap::DashMap;
 use http::{StatusCode, header};
 use ipnet::IpNet;
 use parking_lot::RwLock;
@@ -22,7 +21,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 
 use crate::connector_manager::{ConnectorManager, ConnectorRegistry};
-use crate::rate_limit::{RateLimiter, client_key, is_auth_sensitive_path};
+use crate::rate_limit::{ClientKey, RateLimiter, client_key, is_auth_sensitive_path};
 use crate::security_headers::append_standard_security_headers;
 
 /// Shared with the create/update SSRF gate: same deadline to admit a resource as to route it.
@@ -42,34 +41,49 @@ const ADMIN_API_TARGET: &str = "http://127.0.0.1:8800";
 /// so no user resource can claim it.
 const ADMIN_SUBDOMAIN: &str = "_admin";
 
-/// Hostname from an HTTP `Host` header: strip the optional port, and the brackets
-/// around an IPv6 literal (`[::1]:443` -> `::1`, `example.com:8080` -> `example.com`).
-///
-/// Deliberately does **not** trim. httparse leaves trailing OWS, so trimming would let
-/// `Host: x2rp.example.com ` reach the admin vhost, and a routing decision must not be
-/// reachable through a byte the client chose. A padded Host 404s instead.
-pub fn host_header_hostname(raw: &str) -> &str {
-    if let Some(rest) = raw.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(raw);
+/// Strict RFC 9110 `Host` parser returning the bare hostname or IPv6 literal
+/// (unbracketed). Rejects empty values, whitespace/control chars, invalid ports,
+/// credentials (`@`), non-IPv6 bracketed hosts, and trailing garbage.
+pub fn parse_host_header(raw: &str) -> Option<&str> {
+    if raw.is_empty()
+        || raw
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return None;
     }
-    raw.split(':').next().unwrap_or(raw)
-}
-
-/// Parse an `http`/`https` target URL into (host, port, use_tls).
-fn parse_target_url(target: &str) -> Option<(String, u16, bool)> {
-    let uri = target.parse::<http::Uri>().ok()?;
-    let tls = match uri.scheme_str()? {
-        "https" => true,
-        "http" => false,
-        _ => return None,
+    let valid_port = |port: &str| {
+        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
     };
-    let host = uri.host()?;
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
-    Some((host.to_string(), port, tls))
+    if let Some(rest) = raw.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        inner.parse::<std::net::Ipv6Addr>().ok()?;
+        match after {
+            "" => Some(inner),
+            _ => after
+                .strip_prefix(':')
+                .is_some_and(valid_port)
+                .then_some(inner),
+        }
+    } else {
+        let host = match raw.split_once(':') {
+            Some((h, port)) => {
+                if !valid_port(port) {
+                    return None;
+                }
+                h
+            }
+            None => raw,
+        };
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return None;
+        }
+        Some(host)
+    }
 }
 
 fn default_fail_status_code(e: &Error) -> u16 {
@@ -88,8 +102,9 @@ fn default_fail_status_code(e: &Error) -> u16 {
     }
 }
 
-/// `client METHOD host/target` for a log line, formatted only if the line is emitted.
-struct RequestLine<'a>(&'a Session, &'a str);
+/// `client METHOD host/path` for a log line (omits query strings to avoid leaking
+/// tokens/secrets into INFO access logs), formatted only if emitted.
+struct RequestLine<'a>(&'a Session, Option<IpAddr>);
 
 impl std::fmt::Display for RequestLine<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -98,12 +113,12 @@ impl std::fmt::Display for RequestLine<'_> {
             .headers
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
+            .or_else(|| req.uri.authority().map(http::uri::Authority::as_str))
             .unwrap_or("-");
-        let target = req
-            .uri
-            .path_and_query()
-            .map_or(req.uri.path(), http::uri::PathAndQuery::as_str);
-        write!(f, "{} {} {host}{target}", self.1, req.method)
+        match self.1 {
+            Some(ip) => write!(f, "{ip} {} {host}{}", req.method, req.uri.path()),
+            None => write!(f, "unknown {} {host}{}", req.method, req.uri.path()),
+        }
     }
 }
 
@@ -145,12 +160,23 @@ async fn send_error_response(
     Ok(true)
 }
 
-/// A v4-mapped v6 peer must reduce to its v4 form, or the same client keys a
-/// different rate-limit entry, and misses its v4 allowlist entries, depending on
-/// which stack it arrived on.
-fn client_ip_from_peer(addr: Option<&SocketAddr>) -> String {
-    addr.map(|a| a.ip().to_canonical().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+/// Canonical IP of the peer (v4-mapped v6 reduced to v4) so rate limits and
+/// allowlists match regardless of which IP stack a connection arrived on.
+fn client_ip_from_peer(addr: Option<&SocketAddr>) -> Option<IpAddr> {
+    addr.map(|a| a.ip().to_canonical())
+}
+
+/// RFC 9110 §7.8 upgrade check: both `Upgrade` header and `Connection: upgrade` token.
+fn is_http_upgrade(headers: &http::HeaderMap) -> bool {
+    headers.contains_key(header::UPGRADE)
+        && headers
+            .get_all(header::CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| {
+                v.split(',')
+                    .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
+            })
 }
 
 /// Relay pipe buffer per direction, about a loopback socket's.
@@ -174,17 +200,25 @@ impl std::fmt::Debug for RelayConnect {
 impl L4Connect for RelayConnect {
     async fn connect(&self, _addr: &L4Addr) -> Result<Stream> {
         let (ours, theirs) = tokio::io::duplex(RELAY_PIPE_BYTES);
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         self.manager
-            .bridge(&self.target, theirs)
+            .bridge_cancellable(&self.target, theirs, Some(cancel_rx))
             .map_err(|e| Error::explain(ErrorType::ConnectRefused, e))?;
-        Ok(VirtualSocketStream::new(Box::new(RelayPipe(ours))).into())
+        Ok(VirtualSocketStream::new(Box::new(RelayPipe {
+            stream: ours,
+            _cancel: cancel_tx,
+        }))
+        .into())
     }
 }
 
-/// Pingora's end of the pipe. A local type, because `VirtualSocket` is pingora's
-/// trait and `DuplexStream` tokio's.
+/// Pingora's end of the pipe. Dropping `RelayPipe` drops `_cancel`,
+/// immediately cancelling the connector tunnel and freeing its stream slot.
 #[derive(Debug)]
-struct RelayPipe(tokio::io::DuplexStream);
+struct RelayPipe {
+    stream: tokio::io::DuplexStream,
+    _cancel: tokio::sync::oneshot::Sender<()>,
+}
 
 impl VirtualSocket for RelayPipe {
     /// No socket underneath, so nothing to tune.
@@ -199,7 +233,7 @@ impl tokio::io::AsyncRead for RelayPipe {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
 
@@ -209,15 +243,15 @@ impl tokio::io::AsyncWrite for RelayPipe {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
@@ -256,11 +290,13 @@ impl ProxyResource {
     }
 }
 
+type DnsCacheEntry = (Instant, Arc<[SocketAddr]>);
+
 /// Shared proxy context
 pub struct ProxyContext {
     resources: RwLock<HashMap<String, Arc<ProxyResource>>>,
     /// Keyed by resource origins only, so it stays as small as the route table.
-    dns_cache: DashMap<String, (Instant, Vec<SocketAddr>)>,
+    dns_cache: RwLock<HashMap<String, DnsCacheEntry>>,
     domain: String,
     rate_limiter: RateLimiter,
     pub connectors: Arc<ConnectorRegistry>,
@@ -270,7 +306,7 @@ impl ProxyContext {
     pub fn new(domain: &str, connectors: Arc<ConnectorRegistry>) -> Self {
         Self {
             resources: RwLock::default(),
-            dns_cache: DashMap::new(),
+            dns_cache: RwLock::default(),
             domain: crate::api::normalize_domain(domain),
             rate_limiter: RateLimiter::default(),
             connectors,
@@ -290,10 +326,23 @@ impl ProxyContext {
         self.resources.write().remove(&self.fqdn(subdomain));
     }
 
+    /// Atomically replace `old_subdomain` with `new` under a single write lock so
+    /// live edits never expose a transient 404 window.
+    pub fn replace_resource(&self, old_subdomain: &str, new: Option<ProxyResource>) {
+        let old_fqdn = self.fqdn(old_subdomain);
+        let new_entry = new.map(|r| (self.fqdn(&r.subdomain), Arc::new(r)));
+        let mut map = self.resources.write();
+        map.remove(&old_fqdn);
+        if let Some((fqdn, res)) = new_entry {
+            map.insert(fqdn, res);
+        }
+    }
+
     /// Keep cache and limiter state bounded even when traffic goes idle.
     /// Driven every minute by `main`.
     pub fn maintenance_tick(&self) {
         self.dns_cache
+            .write()
             .retain(|_, (created, _)| created.elapsed() < DNS_CACHE_TTL);
         self.rate_limiter.cleanup_stale();
     }
@@ -312,23 +361,26 @@ impl ProxyContext {
         let key = format!("{host}:{port}");
         let cached = self
             .dns_cache
+            .read()
             .get(&key)
-            .filter(|entry| entry.0.elapsed() < DNS_CACHE_TTL)
-            .map(|entry| entry.1.clone());
+            .filter(|(created, _)| created.elapsed() < DNS_CACHE_TTL)
+            .map(|(_, addrs)| Arc::clone(addrs));
         let addrs = match cached {
             Some(addrs) => addrs,
             None => {
                 let lookup = tokio::net::lookup_host(key.as_str());
-                let addrs: Vec<SocketAddr> = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, lookup)
+                let addrs: Arc<[SocketAddr]> = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, lookup)
                     .await
                     .ok()?
                     .ok()?
                     .collect();
-                self.dns_cache.insert(key, (Instant::now(), addrs.clone()));
+                self.dns_cache
+                    .write()
+                    .insert(key, (Instant::now(), Arc::clone(&addrs)));
                 addrs
             }
         };
-        addrs.into_iter().find(|addr| allowed(addr.ip()))
+        addrs.iter().copied().find(|addr| allowed(addr.ip()))
     }
 }
 
@@ -336,7 +388,7 @@ impl ProxyContext {
 #[derive(Default)]
 pub struct RequestCtx {
     resource: Option<Arc<ProxyResource>>,
-    client_ip: String,
+    client_ip: Option<IpAddr>,
     /// Set first in `request_filter`; the same ID tags every log line and response
     /// this request produces.
     request_id: String,
@@ -367,34 +419,41 @@ impl ProxyHttp for Gateway {
         ctx.request_id = request_id_from_headers(&session.req_header().headers);
         ctx.client_ip = client_ip_from_peer(session.client_addr().and_then(|a| a.as_inet()));
 
-        let host = session
-            .req_header()
+        let req_header = session.req_header();
+        let parsed_host = req_header
             .headers
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
-            .map(host_header_hostname)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+            .or_else(|| req_header.uri.authority().map(http::uri::Authority::as_str))
+            .and_then(parse_host_header)
+            .map(str::to_ascii_lowercase);
         // Only x2rp.<domain> is the admin console; the apex is not.
-        let is_admin_host = host.strip_prefix("x2rp.") == Some(self.ctx.domain.as_str());
+        let is_admin_host = parsed_host
+            .as_deref()
+            .is_some_and(|h| h.strip_prefix("x2rp.") == Some(self.ctx.domain.as_str()));
 
         // Admin login draws the strict tier; everything else the media-friendly one.
         // Keyed per IPv6 /64, or rotating the interface ID would reset the budget.
         let limiter = &self.ctx.rate_limiter;
-        let tier = if is_admin_host && is_auth_sensitive_path(session.req_header().uri.path()) {
+        let tier = if is_admin_host && is_auth_sensitive_path(req_header.uri.path()) {
             &limiter.auth
         } else {
             &limiter.general
         };
-        if !tier.check(&client_key(&ctx.client_ip)) {
+        let limit_key = ctx.client_ip.map_or(ClientKey::Unknown, client_key);
+        if !tier.check(limit_key) {
             tracing::warn!(
                 "Rate limit exceeded: {} [req:{}]",
-                RequestLine(session, &ctx.client_ip),
+                RequestLine(session, ctx.client_ip),
                 ctx.request_id
             );
             return send_error_response(session, &ctx.request_id, StatusCode::TOO_MANY_REQUESTS)
                 .await;
         }
+
+        let Some(host) = parsed_host else {
+            return send_error_response(session, &ctx.request_id, StatusCode::BAD_REQUEST).await;
+        };
 
         let resource = if is_admin_host {
             static ADMIN: LazyLock<Arc<ProxyResource>> = LazyLock::new(|| {
@@ -416,13 +475,12 @@ impl ProxyHttp for Gateway {
         // `None` is a stored allowlist that no longer parses: fail closed.
         let admitted = resource.allowed_clients.as_deref().is_some_and(|nets| {
             ctx.client_ip
-                .parse()
-                .is_ok_and(|ip| crate::allowlist::admits(nets, ip))
+                .is_some_and(|ip| crate::allowlist::admits(nets, ip))
         });
         if !admitted {
             tracing::warn!(
                 "Client not on allowlist: {} [req:{}]",
-                RequestLine(session, &ctx.client_ip),
+                RequestLine(session, ctx.client_ip),
                 ctx.request_id
             );
             return send_error_response(session, &ctx.request_id, StatusCode::FORBIDDEN).await;
@@ -462,6 +520,17 @@ impl ProxyHttp for Gateway {
             .ok_or_else(|| Error::new(ErrorType::InternalError))?;
 
         if let Some(relay) = &ctx.relay {
+            // Defense in depth: relay connectors open plain TCP and never support https:// targets.
+            if !matches!(
+                x2rp_proto::parse_http_origin(&resource.target),
+                Ok((_, _, false))
+            ) {
+                tracing::error!(
+                    "Invalid relay target URL (must be http://): {}",
+                    resource.target
+                );
+                return Err(Error::new(ErrorType::ConnectError));
+            }
             // The path is never dialed (`custom_l4` connects); it only keys the pool.
             let path = format!("/x2rp-relay/{}", resource.subdomain);
             let mut peer = HttpPeer::new_uds(&path, false, String::new())?;
@@ -473,7 +542,7 @@ impl ProxyHttp for Gateway {
             return Ok(Box::new(peer));
         }
 
-        let Some((host, port, tls)) = parse_target_url(&resource.target) else {
+        let Ok((host, port, tls)) = x2rp_proto::parse_http_origin(&resource.target) else {
             tracing::error!("Invalid target URL: {}", resource.target);
             return Err(Error::new(ErrorType::ConnectError));
         };
@@ -492,7 +561,7 @@ impl ProxyHttp for Gateway {
         // DNS-rebinding / SSRF guard: resolve and validate the target IP.
         let peer_addr = self
             .ctx
-            .resolve_host(&host, port, x2rp_proto::ssrf::is_local_direct_target_ip)
+            .resolve_host(host, port, x2rp_proto::ssrf::is_local_direct_target_ip)
             .await
             .ok_or_else(|| {
                 tracing::warn!("Block DNS/SSRF: {host} resolves to no allowed IP");
@@ -506,8 +575,9 @@ impl ProxyHttp for Gateway {
             tls
         );
 
-        let mut peer = HttpPeer::new(peer_addr, tls, host);
+        let mut peer = HttpPeer::new(peer_addr, tls, host.to_string());
         peer.options.connection_timeout = Some(Duration::from_secs(10));
+        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
         peer.options.read_timeout = Some(Duration::from_secs(300));
         peer.options.write_timeout = Some(Duration::from_secs(300));
         peer.options.tcp_keepalive = Some(pingora_core::protocols::TcpKeepalive {
@@ -527,22 +597,29 @@ impl ProxyHttp for Gateway {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Replace whatever the client sent: origins trust these to name the real peer.
+        let client_ip = ctx
+            .client_ip
+            .map_or_else(|| "unknown".to_string(), |ip| ip.to_string());
         upstream_request.remove_header("Forwarded");
-        upstream_request.insert_header("X-Forwarded-For", &ctx.client_ip)?;
-        upstream_request.insert_header("X-Real-IP", &ctx.client_ip)?;
-        // Always "https": Gateway is only registered on the TLS listener ([::]:443). Port 80 traffic is handled by run_http_redirect and never reaches this path.
+        upstream_request.remove_header("X-Scheme");
+        upstream_request.insert_header("X-Forwarded-For", &client_ip)?;
+        upstream_request.insert_header("X-Real-IP", &client_ip)?;
+        // Always "https" / 443: Gateway is only registered on the TLS listener ([::]:443).
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
+        upstream_request.insert_header("X-Forwarded-Port", "443")?;
+        upstream_request.insert_header("X-Request-Id", &ctx.request_id)?;
         // Origins build absolute URLs (redirects, reset links) from this. Every request
         // here was routed by its Host, so that Host is the one to forward.
         if let Some(host) = upstream_request.headers.get(header::HOST).cloned() {
             upstream_request.insert_header("X-Forwarded-Host", host)?;
+        } else {
+            upstream_request.remove_header("X-Forwarded-Host");
         }
 
         // One tunnel per request: pooled, an idle one would hold a connector stream
         // slot, so have the origin close it after this response. Upgrades
         // (WebSocket) keep their own `Connection`.
-        let is_upgrade = upstream_request.headers.contains_key(header::UPGRADE);
-        if ctx.relay.is_some() && !is_upgrade {
+        if ctx.relay.is_some() && !is_http_upgrade(&upstream_request.headers) {
             upstream_request.insert_header(header::CONNECTION, "close")?;
         }
 
@@ -567,7 +644,7 @@ impl ProxyHttp for Gateway {
         ctx: &mut Self::CTX,
     ) -> FailToProxy {
         let code = default_fail_status_code(e);
-        if code > 0 {
+        if code > 0 && session.response_written().is_none() {
             let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if let Err(err) = send_error_response(session, &ctx.request_id, status).await {
                 tracing::error!("Failed to send {code} response downstream: {err}");
@@ -581,7 +658,7 @@ impl ProxyHttp for Gateway {
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
-        let line = RequestLine(session, &ctx.client_ip);
+        let line = RequestLine(session, ctx.client_ip);
         let id = &ctx.request_id;
         match e {
             // Client hang-up mid-response is routine (browser abort, Range seek).
@@ -616,40 +693,58 @@ mod tests {
     #[test]
     fn admin_api_target_matches_the_port() {
         assert_eq!(
-            parse_target_url(ADMIN_API_TARGET).map(|(_, port, _)| port),
+            x2rp_proto::parse_http_origin(ADMIN_API_TARGET)
+                .ok()
+                .map(|(_, port, _)| port),
             Some(ADMIN_API_PORT)
         );
     }
 
     #[test]
-    fn host_header_hostname_strips_ports_and_ipv6_brackets() {
-        assert_eq!(host_header_hostname("example.com"), "example.com");
-        assert_eq!(host_header_hostname("example.com:8080"), "example.com");
-        assert_eq!(host_header_hostname("[::1]:443"), "::1");
-        assert_eq!(host_header_hostname("[2001:db8::1]"), "2001:db8::1");
-        assert_eq!(host_header_hostname(""), "");
+    fn parse_host_header_strips_ports_and_ipv6_brackets() {
+        assert_eq!(parse_host_header("example.com"), Some("example.com"));
+        assert_eq!(parse_host_header("example.com:8080"), Some("example.com"));
+        assert_eq!(parse_host_header("[::1]:443"), Some("::1"));
+        assert_eq!(parse_host_header("[2001:db8::1]"), Some("2001:db8::1"));
+        assert_eq!(parse_host_header(""), None);
     }
 
-    /// httparse leaves trailing OWS on a header value. Trimming it here would let
-    /// `Host: x2rp.<domain> ` route to the admin vhost from one client-chosen byte.
+    /// Reject trailing OWS, non-IPv6 brackets, invalid ports, and suffix junk so
+    /// malformed `Host` headers can neither hit the admin vhost nor smuggle headers.
     #[test]
-    fn host_header_hostname_keeps_padding_out_of_the_admin_vhost() {
-        assert_eq!(
-            host_header_hostname("x2rp.example.com "),
+    fn parse_host_header_rejects_malformed_and_padded_hosts() {
+        for bad in [
             "x2rp.example.com ",
-            "a padded Host must not normalise onto the admin vhost"
-        );
+            " x2rp.example.com",
+            "[x2rp.example.com]junk",
+            "[app.example.com]:443",
+            "x2rp.example.com:junk",
+            "app.example.com:443/x",
+            "app.example.com:",
+            "app.example.com:99999",
+            "app.example.com:+443",
+            "user@app.example.com",
+            "[::1]junk",
+        ] {
+            assert_eq!(parse_host_header(bad), None, "{bad} must be rejected");
+        }
     }
 
     #[test]
     fn client_ip_from_peer_reduces_v4_mapped_peers() {
         let mapped: SocketAddr = "[::ffff:203.0.113.9]:44321".parse().expect("peer addr");
-        assert_eq!(client_ip_from_peer(Some(&mapped)), "203.0.113.9");
+        assert_eq!(
+            client_ip_from_peer(Some(&mapped)),
+            Some("203.0.113.9".parse().unwrap())
+        );
 
         let v6: SocketAddr = "[2001:db8::1]:443".parse().expect("peer addr");
-        assert_eq!(client_ip_from_peer(Some(&v6)), "2001:db8::1");
+        assert_eq!(
+            client_ip_from_peer(Some(&v6)),
+            Some("2001:db8::1".parse().unwrap())
+        );
 
-        assert_eq!(client_ip_from_peer(None), "unknown");
+        assert_eq!(client_ip_from_peer(None), None);
     }
 
     /// A client-supplied ID is echoed into logs and a response header, so only a
@@ -713,10 +808,19 @@ mod tests {
             target: "http://10.0.0.1:80".to_string(),
         };
         let addr = L4Addr::Inet("127.0.0.1:1".parse().expect("addr"));
-        relay.connect(&addr).await.expect("relay pipe");
-        match rx.recv().await {
-            Some(Message::Connect { target, .. }) => assert_eq!(target, "http://10.0.0.1:80"),
+        let pipe = relay.connect(&addr).await.expect("relay pipe");
+        let stream_id = match rx.recv().await {
+            Some(Message::Connect { stream_id, target }) => {
+                assert_eq!(target, "http://10.0.0.1:80");
+                stream_id
+            }
             other => panic!("expected Connect, got {other:?}"),
+        };
+        // Dropping the pipe cancels the pending tunnel and sends Reset immediately.
+        drop(pipe);
+        match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+            Ok(Some(Message::Reset { stream_id: reset })) => assert_eq!(reset, stream_id),
+            other => panic!("expected Reset on pipe drop, got {other:?}"),
         }
     }
 
@@ -724,9 +828,9 @@ mod tests {
     async fn resolve_host_revalidates_cached_entries_for_current_policy() {
         let ctx = ProxyContext::new("", Arc::default());
         let cached = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 443);
-        ctx.dns_cache.insert(
+        ctx.dns_cache.write().insert(
             "invalid.invalid:443".to_string(),
-            (Instant::now(), vec![cached]),
+            (Instant::now(), Arc::from([cached])),
         );
 
         assert_eq!(

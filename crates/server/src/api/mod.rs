@@ -14,6 +14,7 @@ pub use auth_api::*;
 pub use connectors::*;
 pub use resources::*;
 pub use setup_api::*;
+pub use x2rp_proto::{is_valid_domain, is_valid_host, is_valid_label};
 
 pub(crate) const STATE_FILE: &str = "/var/lib/x2rp/state.json";
 
@@ -111,7 +112,10 @@ impl AppState {
 
 pub(crate) fn connector_from_token<'a>(state: &'a AppState, token: &str) -> Option<&'a Connector> {
     let hash = hash_token(token);
-    state.connectors.values().find(|c| c.token_hash == hash)
+    state
+        .connectors
+        .values()
+        .find(|c| crate::auth::constant_time_eq(c.token_hash.as_bytes(), hash.as_bytes()))
 }
 
 #[derive(Clone)]
@@ -123,12 +127,12 @@ pub struct GlobalState {
 
 /// `N` random bytes, hex-encoded: tokens, session ids, record ids.
 pub fn random_hex<const N: usize>() -> String {
-    hex::encode(rand::random::<[u8; N]>())
+    x2rp_proto::encode_hex(&rand::random::<[u8; N]>())
 }
 
 pub fn hash_token(token: &str) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(token.as_bytes()))
+    let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+    x2rp_proto::encode_hex(digest.as_ref())
 }
 
 /// A connector's token from `Authorization: Bearer <token>` (RFC 6750: one or more
@@ -147,55 +151,67 @@ pub(crate) fn bearer_token(headers: &http::HeaderMap) -> Option<&str> {
 pub(crate) fn save_secure_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
     std::fs::create_dir_all(parent)?;
     // `create_new` on a random name: no pre-planted file or symlink can be reused.
     let tmp_path = path.with_extension(format!("tmp.{}", random_hex::<8>()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp_path)?;
-    std::io::Write::write_all(&mut file, data)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp_path, path)?;
-    std::fs::File::open(parent)?.sync_all()
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        std::io::Write::write_all(&mut file, data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_res
 }
 
-/// One DNS label: 1-63 alphanumerics or hyphens, not starting or ending with a hyphen.
-pub(crate) fn is_valid_label(label: &str) -> bool {
-    (1..=63).contains(&label.len())
-        && !label.starts_with('-')
-        && !label.ends_with('-')
-        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-}
-
-/// A hostname: dot-separated labels.
-pub(crate) fn is_valid_host(host: &str) -> bool {
-    host.len() <= 253 && host.split('.').all(is_valid_label)
-}
-
-/// A hostname with at least two labels.
-pub fn is_valid_domain(domain: &str) -> bool {
-    domain.contains('.') && is_valid_host(domain)
-}
-
-/// Check if request has valid admin authentication.
+/// Check if request has valid admin authentication (refreshes session idle deadline).
 pub async fn verify_admin(state: &GlobalState, headers: &http::HeaderMap) -> bool {
     state.state.read().await.initialized
-        && headers
-            .get(http::header::COOKIE)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|cookies| extract_cookie(cookies, ADMIN_SESSION_COOKIE))
+        && extract_cookie_header(headers, ADMIN_SESSION_COOKIE)
             .is_some_and(|sid| state.auth.validate_admin_session(sid))
 }
 
-pub(crate) fn extract_cookie<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
-    cookies.split(';').find_map(|c| {
-        let (k, v) = c.trim().split_once('=')?;
-        (k == name).then_some(v)
-    })
+/// Read-endpoint auth check: when `X-Passive-Poll: 1` is set (periodic UI refresh),
+/// validates without refreshing the idle deadline so unattended tabs still time out.
+pub(crate) async fn verify_admin_read(state: &GlobalState, headers: &http::HeaderMap) -> bool {
+    let passive = headers.get("x-passive-poll").and_then(|v| v.to_str().ok()) == Some("1");
+    state.state.read().await.initialized
+        && extract_cookie_header(headers, ADMIN_SESSION_COOKIE).is_some_and(|sid| {
+            if passive {
+                state.auth.check_admin_session(sid)
+            } else {
+                state.auth.validate_admin_session(sid)
+            }
+        })
+}
+
+/// Extract a named cookie across all `Cookie` headers (RFC 6265 / RFC 9113).
+pub(crate) fn extract_cookie_header<'a>(
+    headers: &'a http::HeaderMap,
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .find_map(|cookies| {
+            cookies.split(';').find_map(|c| {
+                let (k, v) = c.trim().split_once('=')?;
+                (k == name).then_some(v)
+            })
+        })
 }
 
 #[cfg(test)]

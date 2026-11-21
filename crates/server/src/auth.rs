@@ -2,14 +2,17 @@
 
 use crate::api::random_hex;
 
-use std::time::SystemTime;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use argon2::{Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version};
-use dashmap::DashMap;
+use parking_lot::RwLock;
 
-const SESSION_IDLE_TTL_SECS: u64 = 300;
+const SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
 pub(crate) const SESSION_ABSOLUTE_TTL_SECS: u64 = 28800;
+const SESSION_ABSOLUTE_TTL: Duration = Duration::from_secs(SESSION_ABSOLUTE_TTL_SECS);
 const MAX_ADMIN_SESSIONS: usize = 1_000;
 pub const ADMIN_PASSWORD_MIN_LEN: usize = 12;
 pub const ADMIN_PASSWORD_MAX_LEN: usize = 128;
@@ -17,23 +20,24 @@ pub const ADMIN_PASSWORD_MAX_LEN: usize = 128;
 /// Admin UI session: opaque session id + CSRF secret bound to that session.
 struct AdminSession {
     csrf_token: String,
-    created_at: SystemTime,
-    last_access: SystemTime,
+    created_at: Instant,
+    last_access: Instant,
 }
 
 #[derive(Default)]
 pub struct AuthService {
-    admin_sessions: DashMap<String, AdminSession>,
+    admin_sessions: RwLock<HashMap<String, AdminSession>>,
 }
 
 impl AuthService {
     /// Returns `(session_id, csrf_token)`. The CSRF token is bound to this session only.
     pub fn create_admin_session(&self) -> (String, String) {
-        self.make_room();
         let session_id = random_hex::<32>();
         let csrf_token = random_hex::<32>();
-        let now = SystemTime::now();
-        self.admin_sessions.insert(
+        let now = Instant::now();
+        let mut sessions = self.admin_sessions.write();
+        evict_if_full(&mut sessions, now);
+        sessions.insert(
             session_id.clone(),
             AdminSession {
                 csrf_token: csrf_token.clone(),
@@ -44,49 +48,71 @@ impl AuthService {
         (session_id, csrf_token)
     }
 
+    /// Validate an active session and refresh its idle deadline.
     pub fn validate_admin_session(&self, session_id: &str) -> bool {
-        if let Some(mut session) = self.admin_sessions.get_mut(session_id) {
-            if admin_session_expired(&session) {
-                drop(session);
-                self.admin_sessions.remove(session_id);
-                return false;
-            }
-            session.last_access = SystemTime::now();
-            return true;
+        let now = Instant::now();
+        let mut sessions = self.admin_sessions.write();
+        let Some(session) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        if admin_session_expired(session, now) {
+            sessions.remove(session_id);
+            return false;
         }
-        false
+        session.last_access = now;
+        true
+    }
+
+    /// Validate an active session without refreshing `last_access` (passive UI polls).
+    pub fn check_admin_session(&self, session_id: &str) -> bool {
+        let now = Instant::now();
+        self.admin_sessions
+            .read()
+            .get(session_id)
+            .is_some_and(|session| !admin_session_expired(session, now))
     }
 
     /// True when the CSRF token matches the one issued for this session (constant-time).
     pub fn validate_admin_csrf(&self, session_id: &str, csrf_token: &str) -> bool {
-        self.admin_sessions.get(session_id).is_some_and(|session| {
-            !admin_session_expired(&session)
-                && constant_time_eq(session.csrf_token.as_bytes(), csrf_token.as_bytes())
-        })
-    }
-
-    /// Anyone who can post to the login endpoint can mint sessions, so the map is
-    /// capped: expired sessions go first, then the least recently used.
-    fn make_room(&self) {
-        if self.admin_sessions.len() < MAX_ADMIN_SESSIONS {
-            return;
-        }
-        self.cleanup_expired();
-        let excess = (self.admin_sessions.len() + 1).saturating_sub(MAX_ADMIN_SESSIONS);
-        let mut oldest: Vec<(String, SystemTime)> = self
-            .admin_sessions
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.last_access))
-            .collect();
-        oldest.sort_by_key(|(_, last_access)| *last_access);
-        for (key, _) in oldest.into_iter().take(excess) {
-            self.admin_sessions.remove(&key);
-        }
+        let now = Instant::now();
+        self.admin_sessions
+            .read()
+            .get(session_id)
+            .is_some_and(|session| {
+                !admin_session_expired(session, now)
+                    && constant_time_eq(session.csrf_token.as_bytes(), csrf_token.as_bytes())
+            })
     }
 
     pub fn cleanup_expired(&self) {
+        let now = Instant::now();
         self.admin_sessions
-            .retain(|_, session| !admin_session_expired(session));
+            .write()
+            .retain(|_, session| !admin_session_expired(session, now));
+    }
+}
+
+/// Anyone who can post to the login endpoint can mint sessions, so the map is
+/// capped atomically: expired sessions go first, then the least recently used.
+fn evict_if_full(sessions: &mut HashMap<String, AdminSession>, now: Instant) {
+    if sessions.len() < MAX_ADMIN_SESSIONS {
+        return;
+    }
+    sessions.retain(|_, session| !admin_session_expired(session, now));
+    let excess = (sessions.len() + 1).saturating_sub(MAX_ADMIN_SESSIONS);
+    if excess == 0 {
+        return;
+    }
+    let mut oldest: Vec<(String, Instant)> = sessions
+        .iter()
+        .map(|(key, session)| (key.clone(), session.last_access))
+        .collect();
+    let remove_count = excess.min(oldest.len());
+    if remove_count < oldest.len() {
+        oldest.select_nth_unstable_by_key(remove_count - 1, |(_, last_access)| *last_access);
+    }
+    for (key, _) in oldest.into_iter().take(remove_count) {
+        sessions.remove(&key);
     }
 }
 
@@ -97,9 +123,9 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
-fn admin_session_expired(session: &AdminSession) -> bool {
-    elapsed_secs_since(session.last_access) > SESSION_IDLE_TTL_SECS
-        || elapsed_secs_since(session.created_at) > SESSION_ABSOLUTE_TTL_SECS
+fn admin_session_expired(session: &AdminSession, now: Instant) -> bool {
+    now.saturating_duration_since(session.last_access) > SESSION_IDLE_TTL
+        || now.saturating_duration_since(session.created_at) > SESSION_ABSOLUTE_TTL
 }
 
 /// Argon2id per OWASP recommendations (m=9216, t=4, p=1).
@@ -125,17 +151,28 @@ pub async fn hash_password_async(password: String) -> Result<String> {
 /// Each verify holds its Argon2 memory for the whole run, and one client's login
 /// burst would otherwise allocate all of them at once. There is one admin.
 const ARGON2_MAX_CONCURRENT: usize = 2;
-static VERIFY_SLOTS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(ARGON2_MAX_CONCURRENT);
+static VERIFY_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(ARGON2_MAX_CONCURRENT)));
 
-pub async fn verify_password_async(password: String, hash: String) -> bool {
-    // Static semaphore, never closed: the error arm is unreachable, and denies.
-    let Ok(_permit) = VERIFY_SLOTS.acquire().await else {
-        return false;
-    };
-    tokio::task::spawn_blocking(move || verify_password_hash(&password, &hash))
+/// Verify an Argon2id password hash on a blocking thread while holding a permit
+/// inside that thread so a client disconnecting mid-hash cannot leak concurrency.
+/// Returns `None` if all verification slots remain saturated past the wait budget.
+pub async fn verify_password_async(password: String, hash: String) -> Option<bool> {
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        VERIFY_SLOTS.clone().acquire_owned(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            verify_password_hash(&password, &hash)
+        })
         .await
-        .unwrap_or(false)
+        .unwrap_or(false),
+    )
 }
 
 /// Parameters come from the stored PHC string, not `argon2id()`'s.
@@ -145,17 +182,9 @@ fn verify_password_hash(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
-fn elapsed_secs_since(timestamp: SystemTime) -> u64 {
-    SystemTime::now()
-        .duration_since(timestamp)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// A leaked permit wedges every later login, so check the answers and the count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -176,7 +205,7 @@ mod tests {
         for (i, task) in tasks.into_iter().enumerate() {
             assert_eq!(
                 task.await.expect("verify task should join"),
-                i % 2 == 0,
+                Some(i % 2 == 0),
                 "verify {i}"
             );
         }
@@ -222,18 +251,34 @@ mod tests {
         let auth = AuthService::default();
         for (created_ago, idle_for) in [
             (SESSION_ABSOLUTE_TTL_SECS + 1, 0),
-            (2000, SESSION_IDLE_TTL_SECS + 1),
+            (2000, SESSION_IDLE_TTL.as_secs() + 1),
         ] {
             let (sid, csrf) = auth.create_admin_session();
             assert!(auth.validate_admin_session(&sid) && auth.validate_admin_csrf(&sid, &csrf));
             {
-                let mut session = auth.admin_sessions.get_mut(&sid).expect("session");
-                session.created_at = SystemTime::now() - Duration::from_secs(created_ago);
-                session.last_access = SystemTime::now() - Duration::from_secs(idle_for);
+                let mut sessions = auth.admin_sessions.write();
+                let session = sessions.get_mut(&sid).expect("session");
+                let now = Instant::now();
+                session.created_at = now - Duration::from_secs(created_ago);
+                session.last_access = now - Duration::from_secs(idle_for);
             }
             assert!(!auth.validate_admin_session(&sid));
-            assert!(!auth.admin_sessions.contains_key(&sid));
+            assert!(!auth.admin_sessions.read().contains_key(&sid));
         }
+    }
+
+    #[test]
+    fn passive_check_does_not_refresh_idle_deadline() {
+        let auth = AuthService::default();
+        let (sid, _) = auth.create_admin_session();
+        let backdated = Instant::now() - Duration::from_secs(100);
+        auth.admin_sessions
+            .write()
+            .get_mut(&sid)
+            .expect("session")
+            .last_access = backdated;
+        assert!(auth.check_admin_session(&sid));
+        assert_eq!(auth.admin_sessions.read()[&sid].last_access, backdated);
     }
 
     #[test]
@@ -242,6 +287,6 @@ mod tests {
         for _ in 0..MAX_ADMIN_SESSIONS + 5 {
             auth.create_admin_session();
         }
-        assert!(auth.admin_sessions.len() <= MAX_ADMIN_SESSIONS);
+        assert!(auth.admin_sessions.read().len() <= MAX_ADMIN_SESSIONS);
     }
 }

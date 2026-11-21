@@ -43,7 +43,7 @@ case "$WHAT" in
     all) BINS=(x2rp x2rp-connector) ;;
 esac
 
-FLAGS=(--target "$TARGET" --manifest-path "$ROOT/Cargo.toml")
+FLAGS=(--locked --target "$TARGET" --manifest-path "$ROOT/Cargo.toml")
 [ "$PROFILE" = release ] && FLAGS+=(--release)
 for bin in "${BINS[@]}"; do
     FLAGS+=(-p "$bin")

@@ -29,16 +29,19 @@ the server binary, and loads no external resources.
 ### Edge proxy
 
 The edge is built on [Pingora](https://github.com/cloudflare/pingora). It
-terminates TLS 1.2 and 1.3 on TCP 443 and routes each request by `Host` to a
-loopback origin or a connector; unknown hosts get `404`. TCP 80 redirects the
-domain and its subdomains to HTTPS and answers anything else with `400`.
+terminates TLS 1.2 and 1.3 on TCP 443 with strict SNI matching `<domain>` and
+`*.<domain>` and routes each request by `Host` to a loopback origin or a
+connector; missing or malformed `Host` headers get `400` and unknown hosts get
+`404`. TCP 80 enforces bounded connection and header limits, redirects the
+domain and its single-label subdomains to HTTPS with `Connection: close`, and
+answers anything else with `400`.
 
-Origins receive `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto` and
-`X-Forwarded-Host` set by the proxy, and any client-supplied `Forwarded`
-header is removed. Responses carry an `X-Request-Id`, plus HSTS,
-`X-Content-Type-Options`, `Referrer-Policy` and `X-Frame-Options` where the
-origin did not set them. The console itself is served through the same edge
-from the admin API on `127.0.0.1:8800`.
+Origins receive `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`,
+`X-Forwarded-Host` and `X-Request-Id` set by the proxy, and any client-supplied
+`Forwarded` header is removed. Responses carry an `X-Request-Id`, always
+enforce HSTS and `X-Content-Type-Options`, and add `Referrer-Policy` and
+`X-Frame-Options` where the origin did not set them. The console itself is
+served through the same edge from the admin API on `127.0.0.1:8800`.
 
 ### Connectors
 
@@ -97,11 +100,12 @@ login endpoint to 40 per minute with a burst of 15; over-limit requests get
 
 The console password is hashed with Argon2id using OWASP parameters. A login
 takes at least 500 ms whatever the outcome, and at most two hash
-verifications run at once. Sessions expire after 5 minutes idle or 8 hours in
+verifications run at once (extra concurrent attempts get `503`). Sessions expire after 5 minutes idle or 8 hours in
 total. The session cookie is `__Host-` prefixed, `HttpOnly`, `Secure` and
 `SameSite=Strict`, every state-changing console request needs a CSRF token
 bound to the session, and the console is served with a strict Content
-Security Policy. The admin API listens on loopback only, and no route on the
+Security Policy, `Permissions-Policy`, `Cross-Origin-Opener-Policy` and
+`Cross-Origin-Resource-Policy`. The admin API listens on loopback only, and no route on the
 server may target its port.
 
 Connector tokens are 256-bit random values, stored as SHA-256 hashes and
@@ -202,7 +206,7 @@ on the private host. The token is shown once. The command installs the
 connector version matching the server:
 
 ```sh
-curl -fsSL https://github.com/vwkyc/x2rp/releases/download/v1.0.6/install-connector.sh | sudo bash -s -- --server https://x2rp.example.com --token '<token>'
+curl -fsSL https://github.com/vwkyc/x2rp/releases/download/v1.1.0/install-connector.sh | sudo bash -s -- --server https://x2rp.example.com --token '<token>'
 ```
 
 Keep connectors on the server's version. After upgrading the server, run the

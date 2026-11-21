@@ -127,3 +127,25 @@ async fn csrf_exempts_auth_login_path() {
     let resp = app.oneshot(req).await.expect("middleware should forward");
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn csrf_reads_session_across_multiple_cookie_headers() {
+    let auth = test_auth();
+    let (session_id, csrf) = auth.create_admin_session();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/resource")
+        .header(header::COOKIE, "other=1")
+        .header(header::COOKIE, format!("__Host-x2rp_session={session_id}"))
+        .header("x-csrf-token", csrf)
+        .body(Body::empty())
+        .expect("request");
+    assert_eq!(
+        csrf_app(test_state(auth), "/resource")
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}

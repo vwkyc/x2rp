@@ -220,17 +220,17 @@ impl Message {
             buf.extend_from_slice(&stream_id.to_be_bytes());
         }
         match self {
-            Self::Connect { target, .. } => put_str(buf, target, 0, MAX_CONNECT_TARGET_LEN),
+            Self::Connect { target, .. } => put_str(buf, target, 1, MAX_CONNECT_TARGET_LEN),
             Self::ConnectErr { error, .. } => {
                 let error = &error[..error.floor_char_boundary(MAX_CONNECT_ERR_LEN)];
                 put_str(buf, error, 0, MAX_CONNECT_ERR_LEN)
             }
             Self::Auth { token } => put_str(buf, token, 1, MAX_AUTH_TOKEN_LEN),
             Self::Data { payload, .. } => {
-                if payload.len() > MAX_DATA_PAYLOAD_LEN {
+                if payload.is_empty() || payload.len() > MAX_DATA_PAYLOAD_LEN {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("data payload too large: {} bytes", payload.len()),
+                        format!("data payload length {} invalid", payload.len()),
                     ));
                 }
                 buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -238,6 +238,12 @@ impl Message {
                 Ok(())
             }
             Self::WindowUpdate { bytes, .. } => {
+                if *bytes == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "window update must be non-zero",
+                    ));
+                }
                 buf.extend_from_slice(&bytes.to_be_bytes());
                 Ok(())
             }
@@ -283,7 +289,7 @@ impl Message {
         let msg = match MessageType::try_from(buf.get_u8())? {
             MessageType::Connect => Self::Connect {
                 stream_id: get_u32(&mut buf)?,
-                target: get_str(&mut buf, 0, MAX_CONNECT_TARGET_LEN)?,
+                target: get_str(&mut buf, 1, MAX_CONNECT_TARGET_LEN)?,
             },
             MessageType::ConnectOk => Self::ConnectOk {
                 stream_id: get_u32(&mut buf)?,
@@ -295,7 +301,7 @@ impl Message {
             MessageType::Data => {
                 let stream_id = get_u32(&mut buf)?;
                 let len = get_u32(&mut buf)? as usize;
-                if len > MAX_DATA_PAYLOAD_LEN || buf.remaining() < len {
+                if len == 0 || len > MAX_DATA_PAYLOAD_LEN || buf.remaining() < len {
                     return Err(bad(format!("data payload length {len} invalid")));
                 }
                 Self::Data {
@@ -309,10 +315,14 @@ impl Message {
             MessageType::Reset => Self::Reset {
                 stream_id: get_u32(&mut buf)?,
             },
-            MessageType::WindowUpdate => Self::WindowUpdate {
-                stream_id: get_u32(&mut buf)?,
-                bytes: get_u32(&mut buf)?,
-            },
+            MessageType::WindowUpdate => {
+                let stream_id = get_u32(&mut buf)?;
+                let bytes = get_u32(&mut buf)?;
+                if bytes == 0 {
+                    return Err(bad("window update must be non-zero"));
+                }
+                Self::WindowUpdate { stream_id, bytes }
+            }
             MessageType::Auth => Self::Auth {
                 token: get_str(&mut buf, 1, MAX_AUTH_TOKEN_LEN)?,
             },
@@ -338,8 +348,10 @@ pub async fn read_frame(recv: &mut quinn::RecvStream) -> io::Result<Message> {
     Message::decode(body.into())
 }
 
-/// QUIC transport settings both ends share.
-pub fn quic_transport_config() -> quinn::TransportConfig {
+/// QUIC transport settings both ends share; `max_peer_bidi_streams` limits how many
+/// streams the remote peer may initiate (1 on the server for `Auth`, `MAX_ACTIVE_STREAMS`
+/// on the connector for tunnels).
+pub fn quic_transport_config(max_peer_bidi_streams: u32) -> quinn::TransportConfig {
     use quinn::VarInt;
     // Leave room for the obfuscation IV after Quinn sizes each packet.
     let mut mtu = quinn::MtuDiscoveryConfig::default();
@@ -353,7 +365,7 @@ pub fn quic_transport_config() -> quinn::TransportConfig {
         ))
         .receive_window(VarInt::from_u32(1024 * 1024))
         .stream_receive_window(VarInt::from_u32(STREAM_RECV_WINDOW as u32))
-        .max_concurrent_bidi_streams(VarInt::from_u32(MAX_ACTIVE_STREAMS as u32))
+        .max_concurrent_bidi_streams(VarInt::from_u32(max_peer_bidi_streams))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .mtu_discovery_config(Some(mtu));
     config
@@ -386,13 +398,17 @@ impl SendCredit {
     /// Grant `bytes` more credit and wake a parked sender.
     /// Outstanding credit never exceeds the initial window.
     pub fn add(&self, bytes: usize) {
-        let _ = self
+        let delta = i64::try_from(bytes).unwrap_or(i64::MAX);
+        if self
             .credit
             .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                let next = cur.saturating_add(bytes as i64).min(self.max);
+                let next = cur.saturating_add(delta).min(self.max);
                 (next > cur).then_some(next)
-            });
-        self.notify.notify_waiters();
+            })
+            .is_ok()
+        {
+            self.notify.notify_waiters();
+        }
     }
 
     /// Permanently close: any current or future `acquire` returns `false`.
@@ -511,6 +527,29 @@ mod tests {
             bytes: 1,
         });
         assert!(Message::decode(window.slice(..8)).is_err(), "truncated");
+
+        for bad_msg in [
+            Message::Data {
+                stream_id: 1,
+                payload: Bytes::new(),
+            },
+            Message::WindowUpdate {
+                stream_id: 1,
+                bytes: 0,
+            },
+            Message::Connect {
+                stream_id: 1,
+                target: String::new(),
+            },
+        ] {
+            assert!(bad_msg.encode().is_err(), "{bad_msg:?}");
+        }
+        for raw in [
+            &[MessageType::Data as u8, 0, 0, 0, 1, 0, 0, 0, 0][..],
+            &[MessageType::WindowUpdate as u8, 0, 0, 0, 1, 0, 0, 0, 0][..],
+        ] {
+            assert!(Message::decode(Bytes::copy_from_slice(raw)).is_err());
+        }
     }
 
     #[test]

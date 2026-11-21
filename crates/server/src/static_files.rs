@@ -12,12 +12,12 @@ const ASSETS: [(&str, &str, &[u8]); 5] = [
     ),
     (
         "admin.css",
-        "text/css",
+        "text/css; charset=utf-8",
         include_bytes!("../../../web/admin.css"),
     ),
     (
         "app.js",
-        "text/javascript",
+        "text/javascript; charset=utf-8",
         include_bytes!("../../../web/app.js"),
     ),
     (
@@ -27,7 +27,7 @@ const ASSETS: [(&str, &str, &[u8]); 5] = [
     ),
     (
         "login.js",
-        "text/javascript",
+        "text/javascript; charset=utf-8",
         include_bytes!("../../../web/login.js"),
     ),
 ];
@@ -52,11 +52,9 @@ pub fn serve_static(path: &str) -> Response {
         return (StatusCode::NOT_FOUND, "404 Not Found").into_response();
     };
     let mut response = ([(header::CONTENT_TYPE, *mime)], *body).into_response();
-    if name.ends_with(".html") {
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

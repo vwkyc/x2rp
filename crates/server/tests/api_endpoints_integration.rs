@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use x2rp::{
     api::{
         self, AppState, CreateResourceRequest, GlobalState, ServerConfig, UpdateConnectorRequest,
-        auth_login, connector_get_settings, create_resource, delete_connector,
+        auth_login, connector_get_settings, create_resource, delete_connector, list_connectors,
         regenerate_connector_token, update_connector,
     },
     auth::{ADMIN_PASSWORD_MAX_LEN, hash_password},
@@ -103,15 +103,16 @@ async fn auth_login_rejects_invalid_password() {
 
 #[tokio::test]
 async fn auth_login_rejects_oversized_password_without_hashing() {
+    let oversized = "x".repeat(ADMIN_PASSWORD_MAX_LEN + 1);
     let mut app = base_app_state();
-    app.admin_password_hash =
-        Some(hash_password("another-strong-password").expect("password hash should build"));
+    // Hash the actual oversized password so the test only passes if the length cap rejects first.
+    app.admin_password_hash = Some(hash_password(&oversized).expect("password hash should build"));
 
     let state = make_state(app);
     let result = auth_login(
         State(state),
         Json(api::auth_api::LoginRequest {
-            password: "x".repeat(ADMIN_PASSWORD_MAX_LEN + 1),
+            password: oversized,
         }),
     )
     .await;
@@ -303,5 +304,19 @@ async fn rotating_or_deleting_a_relay_connector_drops_its_live_session() {
     assert!(
         registry.get("relay-delete").is_none(),
         "a deleted connector's session must be dropped"
+    );
+}
+
+#[tokio::test]
+async fn passive_poll_allows_valid_session_and_rejects_invalid() {
+    let (state, mut headers) = admin_state(base_app_state());
+    headers.insert("x-passive-poll", "1".parse().unwrap());
+    assert!(list_connectors(State(state.clone()), headers).await.is_ok());
+
+    let mut bad = HeaderMap::new();
+    bad.insert("x-passive-poll", "1".parse().unwrap());
+    assert_eq!(
+        list_connectors(State(state), bad).await.err(),
+        Some(StatusCode::UNAUTHORIZED)
     );
 }

@@ -14,14 +14,16 @@ mod transport_quic;
 mod transport_wss;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::transport::TransportConfig;
+use crate::transport::{TransportConfig, https_get};
 
 const SERVICE: &str = "x2rp-connector";
 const CONFIG_FILE: &str = "/etc/x2rp-connector/config.json";
@@ -30,22 +32,50 @@ const STABLE_SESSION: Duration = Duration::from_secs(30);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Parser)]
-#[command(name = "x2rp-connector")]
-#[command(about = "x2rp connector (QUIC with WebSocket fallback)")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+enum Command {
+    Run,
+    Status,
+    Logs,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Run the connector (used by systemd)
-    Run,
-    /// Show service status
-    Status,
-    /// Show connector logs (follows journald)
-    Logs,
+fn usage() -> &'static str {
+    "Usage: x2rp-connector <run|status|logs>\n\n\
+     x2rp connector (QUIC with WebSocket fallback)\n\n\
+     Commands:\n  \
+       run     Run the connector (used by systemd)\n  \
+       status  Show service status\n  \
+       logs    Show connector logs (follows journald)\n"
+}
+
+fn parse_cli() -> Command {
+    let mut args = std::env::args().skip(1);
+    let Some(cmd) = args.next() else {
+        eprint!("{}", usage());
+        std::process::exit(2);
+    };
+    if args.next().is_some() {
+        eprintln!("Unexpected extra argument");
+        eprint!("{}", usage());
+        std::process::exit(2);
+    }
+    match cmd.as_str() {
+        "run" => Command::Run,
+        "status" => Command::Status,
+        "logs" => Command::Logs,
+        "help" | "-h" | "--help" => {
+            print!("{}", usage());
+            std::process::exit(0);
+        }
+        "-V" | "--version" => {
+            println!("x2rp-connector {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        other => {
+            eprintln!("Unknown command: {other}");
+            eprint!("{}", usage());
+            std::process::exit(2);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -61,30 +91,44 @@ struct ServerSettings {
     force_wss: bool,
 }
 
+fn max_log_level() -> tracing::Level {
+    let default = if cfg!(debug_assertions) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+    std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|raw| {
+            raw.split(',')
+                .find_map(|p| {
+                    let p = p.trim();
+                    p.strip_prefix("x2rp_connector=")
+                        .or_else(|| (!p.contains('=')).then_some(p))
+                })
+                .and_then(|lvl| lvl.parse().ok())
+        })
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let command = parse_cli();
 
-    let default_filter = if cfg!(debug_assertions) {
-        "x2rp_connector=debug"
-    } else {
-        "x2rp_connector=info"
-    };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
-        )
+        .without_time()
+        .with_target(false)
+        .with_max_level(max_log_level())
         .init();
 
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install Rustls crypto provider");
 
-    let result = match cli.command {
-        Commands::Run => cmd_run().await,
-        Commands::Status => x2rp_proto::cmd_status(SERVICE).map_err(Into::into),
-        Commands::Logs => x2rp_proto::cmd_logs(SERVICE).map_err(Into::into),
+    let result = match command {
+        Command::Run => cmd_run().await,
+        Command::Status => x2rp_proto::cmd_status(SERVICE).map_err(Into::into),
+        Command::Logs => x2rp_proto::cmd_logs(SERVICE).map_err(Into::into),
     };
 
     if let Err(e) = result {
@@ -96,12 +140,16 @@ async fn main() {
 async fn cmd_run() -> Result<()> {
     info!("x2rp connector starting");
     let config = load_config()?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut sigterm = signal(SignalKind::terminate())?;
-    tokio::select! {
-        result = reconnect_loop(&config) => result?,
-        _ = sigterm.recv() => info!("Received SIGTERM"),
-        _ = tokio::signal::ctrl_c() => info!("Received SIGINT"),
-    }
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => info!("Received SIGTERM"),
+            _ = tokio::signal::ctrl_c() => info!("Received SIGINT"),
+        }
+        let _ = shutdown_tx.send(true);
+    });
+    reconnect_loop(&config, shutdown_rx).await?;
     info!("Connector shutdown complete");
     Ok(())
 }
@@ -109,12 +157,12 @@ async fn cmd_run() -> Result<()> {
 /// Every reconnect re-polls settings, and its 401 is the one terminal signal:
 /// returning `Ok` exits 0, so systemd (`Restart=on-failure`) leaves a deleted
 /// connector stopped. Any transport failure just backs off into that check.
-async fn reconnect_loop(config: &Config) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let settings_url = format!("{}/api/connector/settings", config.server);
+async fn reconnect_loop(config: &Config, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    let tls_config = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_platform_verifier()?
+            .with_no_client_auth(),
+    );
     let mut transport_config = TransportConfig {
         server: config.server.clone(),
         token: config.token.clone(),
@@ -124,74 +172,123 @@ async fn reconnect_loop(config: &Config) -> Result<()> {
     let mut retry_count = 0u32;
 
     loop {
-        match client
-            .get(&settings_url)
-            .bearer_auth(&config.token)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                error!("Connector authorization rejected by server (deleted or token invalid)");
-                error!("To reconnect, create a new connector in the admin UI and reinstall");
-                return Ok(());
-            }
-            Ok(resp) if resp.status().is_success() => match resp.json::<ServerSettings>().await {
-                Ok(settings) => {
-                    if settings.force_wss != transport_config.force_wss {
-                        let state = if settings.force_wss {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        };
-                        info!("Force WSS {state} by admin");
-                    }
-                    transport_config.obfuscation_secret = settings.obfuscation_secret;
-                    transport_config.force_wss = settings.force_wss;
-                }
-                Err(e) => warn!("Failed to parse server settings: {e}"),
-            },
-            Ok(resp) => warn!("Server settings request failed: {}", resp.status()),
-            Err(e) => warn!("Failed to fetch server settings: {e}"),
+        if *shutdown.borrow() {
+            return Ok(());
         }
+        let fetched = tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            res = https_get(&transport_config, "/api/connector/settings", &tls_config) => match res {
+                Ok((401, _)) => {
+                    error!("Connector authorization rejected by server (deleted or token invalid)");
+                    error!("To reconnect, create a new connector in the admin UI and reinstall");
+                    return Ok(());
+                }
+                Ok((200..=299, body)) => match serde_json::from_slice::<ServerSettings>(&body) {
+                    Ok(settings) => {
+                        if settings.force_wss != transport_config.force_wss {
+                            let state = if settings.force_wss {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            };
+                            info!("Force WSS {state} by admin");
+                        }
+                        transport_config.obfuscation_secret = settings.obfuscation_secret;
+                        transport_config.force_wss = settings.force_wss;
+                        true
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse server settings: {e}");
+                        false
+                    }
+                },
+                Ok((status, _)) => {
+                    warn!("Server settings request failed: HTTP {status}");
+                    false
+                }
+                Err(e) => {
+                    warn!("Failed to fetch server settings: {e}");
+                    false
+                }
+            },
+        };
 
-        let started = tokio::time::Instant::now();
-        match run_session(&transport_config).await {
-            Ok(()) => info!("Session ended"),
-            Err(e) => error!("Connection error: {e}"),
+        // Measure only live session duration (never connect timeouts across multi-IP
+        // blackholes) so repeated connect failures never reset the backoff.
+        let mut session_duration = Duration::ZERO;
+        if fetched {
+            let connected = tokio::select! {
+                _ = shutdown.changed() => return Ok(()),
+                res = connect_session(&transport_config, &tls_config) => res,
+            };
+            match connected {
+                Ok(session) => {
+                    let started = tokio::time::Instant::now();
+                    match session.run(shutdown.clone()).await {
+                        Ok(()) => info!("Session ended"),
+                        Err(e) => error!("Connection error: {e}"),
+                    }
+                    session_duration = started.elapsed();
+                }
+                Err(e) => error!("Connection error: {e}"),
+            }
+        }
+        if *shutdown.borrow() {
+            return Ok(());
         }
         // Back off unless the session held. A QUIC close reads as a clean end, so a
         // server that drops us right after auth (session cap) would be redialed hot.
-        if started.elapsed() >= STABLE_SESSION {
+        if session_duration >= STABLE_SESSION {
             retry_count = 0;
             continue;
         }
         retry_count = retry_count.saturating_add(1);
         let wait = reconnect_backoff_secs(retry_count);
         warn!("Reconnecting in {wait}s (attempt {retry_count})");
-        tokio::time::sleep(Duration::from_secs(wait)).await;
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            () = tokio::time::sleep(Duration::from_secs(wait)) => {}
+        }
+    }
+}
+
+enum ConnectedSession {
+    Quic(transport_quic::QuicSession),
+    Wss(transport_wss::WssSession),
+}
+
+impl ConnectedSession {
+    async fn run(self, shutdown: watch::Receiver<bool>) -> std::io::Result<()> {
+        match self {
+            Self::Quic(s) => s.run(shutdown).await,
+            Self::Wss(s) => s.run(shutdown).await,
+        }
     }
 }
 
 /// Prefer QUIC when the obfuscation secret is known; fall back to WSS otherwise.
 /// `force_wss` (admin-set) skips the QUIC attempt entirely.
-async fn run_session(config: &TransportConfig) -> std::io::Result<()> {
+async fn connect_session(
+    config: &TransportConfig,
+    tls_config: &Arc<rustls::ClientConfig>,
+) -> std::io::Result<ConnectedSession> {
     if config.force_wss {
         info!("Force WSS enabled; skipping QUIC");
     } else if config.obfuscation_secret.is_empty() {
         warn!("Obfuscation secret unavailable; connecting via WSS only");
     } else {
-        match transport_quic::connect(config).await {
+        match transport_quic::connect(config, tls_config).await {
             Ok(session) => {
                 info!("Connected via QUIC");
-                return session.run().await;
+                return Ok(ConnectedSession::Quic(session));
             }
             Err(e) => warn!("QUIC connect failed ({e}); trying WSS"),
         }
     }
 
-    let session = transport_wss::connect(config).await?;
+    let session = transport_wss::connect(config, tls_config).await?;
     info!("Connected via WSS");
-    session.run().await
+    Ok(ConnectedSession::Wss(session))
 }
 
 fn load_config() -> Result<Config> {
@@ -203,16 +300,17 @@ fn load_config() -> Result<Config> {
     };
     let mut config: Config = serde_json::from_slice(&data)?;
     config.server = normalize_server_origin(&config.server)?;
+    if config.token.trim().is_empty() {
+        return Err("Config error: connector token is empty".into());
+    }
     Ok(config)
 }
 
 /// `https://host[:port]` with no path, query or credentials.
 fn normalize_server_origin(server: &str) -> Result<String> {
     let normalized = server.trim().trim_end_matches('/');
-    match normalized.strip_prefix("https://") {
-        Some(host) if !host.is_empty() && !host.contains(['/', '?', '#', '@']) => {
-            Ok(normalized.to_string())
-        }
+    match x2rp_proto::parse_http_origin(normalized) {
+        Ok((_, _, true)) => Ok(normalized.to_string()),
         _ => Err("Config error: server must be a bare HTTPS origin (https://host[:port])".into()),
     }
 }

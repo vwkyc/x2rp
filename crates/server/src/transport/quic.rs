@@ -16,7 +16,10 @@ use crate::api::GlobalState;
 use crate::connector_manager::{ConnectorManager, Link};
 use crate::transport::set_last_seen;
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap in-flight unauthenticated QUIC handshakes so UDP floods cannot spawn unbounded tasks.
+const MAX_CONCURRENT_HANDSHAKES: usize = MAX_CONNECTOR_SESSIONS * 2;
 /// Application close code for a rejected token (connector deleted or rotated).
 const UNAUTHORIZED: VarInt = VarInt::from_u32(1);
 
@@ -37,7 +40,8 @@ pub fn create_quic_endpoint(
     let crypto =
         quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(std::io::Error::other)?;
     let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
-    server_config.transport_config(Arc::new(x2rp_proto::quic_transport_config()));
+    // Connectors only ever initiate one bidi stream (the initial Auth frame).
+    server_config.transport_config(Arc::new(x2rp_proto::quic_transport_config(1)));
 
     let socket = ObfuscatedSocket::bind(
         (Ipv6Addr::UNSPECIFIED, QUIC_PORT).into(),
@@ -59,19 +63,30 @@ pub fn create_quic_endpoint(
 }
 
 pub async fn quic_accept_loop(endpoint: Endpoint, state: GlobalState) {
-    // Slots are taken only after token auth, so failed handshakes cost nothing.
-    let sessions = Arc::new(Semaphore::new(MAX_CONNECTOR_SESSIONS));
+    // Cap in-flight unauthenticated handshakes so UDP floods cannot spawn unbounded tasks.
+    let handshakes = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
     while let Some(incoming) = endpoint.accept().await {
-        let (state, sessions) = (state.clone(), sessions.clone());
+        let remote = incoming.remote_address();
+        let Ok(handshake_permit) = handshakes.clone().try_acquire_owned() else {
+            debug!("QUIC handshake cap reached; dropping incoming from {remote}");
+            incoming.refuse();
+            continue;
+        };
+        let state = state.clone();
         tokio::spawn(async move {
-            let remote = incoming.remote_address();
-            match incoming.await {
-                Ok(connection) => {
-                    if let Err(e) = run_session(connection, state, sessions).await {
-                        warn!("QUIC connector session from {remote}: {e}");
-                    }
+            let connection = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    debug!("QUIC handshake from {remote} failed: {e}");
+                    return;
                 }
-                Err(e) => debug!("QUIC handshake from {remote} failed: {e}"),
+                Err(_) => {
+                    debug!("QUIC handshake from {remote} timed out");
+                    return;
+                }
+            };
+            if let Err(e) = run_session(connection, state, handshake_permit).await {
+                warn!("QUIC connector session from {remote}: {e}");
             }
         });
     }
@@ -80,7 +95,7 @@ pub async fn quic_accept_loop(endpoint: Endpoint, state: GlobalState) {
 async fn run_session(
     connection: quinn::Connection,
     state: GlobalState,
-    sessions: Arc<Semaphore>,
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), BoxError> {
     let auth = async {
         let (_, mut control) = connection.accept_bi().await?;
@@ -92,22 +107,27 @@ async fn run_session(
     let token = tokio::time::timeout(AUTH_TIMEOUT, auth)
         .await
         .map_err(|_| "auth timed out")??;
-    let connector_id =
-        crate::api::connector_from_token(&*state.state.read().await, &token).map(|c| c.id.clone());
-    let Some(connector_id) = connector_id else {
+    drop(handshake_permit);
+    let connector = crate::api::connector_from_token(&*state.state.read().await, &token)
+        .map(|c| (c.id.clone(), c.force_wss));
+    let Some((connector_id, force_wss)) = connector else {
         connection.close(UNAUTHORIZED, b"unauthorized");
         return Err("invalid token".into());
     };
-    let Ok(_permit) = sessions.try_acquire_owned() else {
-        return Err(format!("connector {connector_id}: session limit reached").into());
-    };
+    if force_wss {
+        connection.close(0u32.into(), b"wss_only");
+        return Err(format!("connector {connector_id}: WebSocket-only mode enabled").into());
+    }
 
     let manager = Arc::new(ConnectorManager::new(
         connector_id.clone(),
         Link::Quic(connection.clone()),
     ));
     let registry = &state.proxy_ctx.connectors;
-    registry.register(manager.clone());
+    if !registry.try_register(manager.clone(), MAX_CONNECTOR_SESSIONS) {
+        connection.close(0u32.into(), b"overloaded");
+        return Err(format!("connector {connector_id}: session limit reached").into());
+    }
     set_last_seen(&state, &connector_id).await;
     info!(
         "Connector {connector_id} connected via QUIC from {}",

@@ -14,45 +14,78 @@ use x2rp_proto::{ALPN, Message, TUNNEL_READ_CHUNK, read_frame};
 
 use crate::transport::{TransportConfig, connect_any, connect_backend};
 
-/// Bound the `Connect` read so a stalled stream cannot hold its task forever.
+/// Bound the `Connect` read and `Auth` write so a stalled stream cannot hold its task forever.
 const CONNECT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Server application close code for an unauthorized/rotated token.
+const UNAUTHORIZED: quinn::VarInt = quinn::VarInt::from_u32(1);
 
 pub(crate) struct QuicSession {
-    _endpoint: Endpoint,
+    endpoint: Endpoint,
     connection: Connection,
 }
 
-impl QuicSession {
-    /// Serve tunnels until the connection ends; `Ok` when the server closed it.
-    pub(crate) async fn run(self) -> io::Result<()> {
-        loop {
-            match self.connection.accept_bi().await {
-                Ok((send, recv)) => {
-                    tokio::spawn(splice_data_stream(send, recv));
-                }
-                Err(ConnectionError::ApplicationClosed(_)) => return Ok(()),
-                Err(e) => return Err(io::Error::other(e)),
-            }
-        }
+impl Drop for QuicSession {
+    fn drop(&mut self) {
+        self.connection.close(0u32.into(), b"shutdown");
     }
 }
 
-pub(crate) async fn connect(config: &TransportConfig) -> io::Result<QuicSession> {
-    use rustls_platform_verifier::BuilderVerifierExt;
-    let tls = rustls::ClientConfig::builder()
-        .with_platform_verifier()
-        .map_err(io::Error::other)?
-        .with_no_client_auth();
-    connect_with(config, client_config(tls)?).await
+impl QuicSession {
+    /// Serve tunnels until the connection ends or `shutdown` signals; `Ok` on clean close.
+    pub(crate) async fn run(
+        self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> io::Result<()> {
+        let mut tasks = tokio::task::JoinSet::new();
+        let result = loop {
+            if *shutdown.borrow() {
+                break Ok(());
+            }
+            tokio::select! {
+                _ = shutdown.changed() => break Ok(()),
+                accepted = self.connection.accept_bi() => match accepted {
+                    Ok((send, recv)) => {
+                        tasks.spawn(splice_data_stream(send, recv));
+                    }
+                    Err(ConnectionError::ApplicationClosed(close))
+                        if close.error_code == UNAUTHORIZED =>
+                    {
+                        break Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "QUIC authorization rejected by server",
+                        ));
+                    }
+                    Err(ConnectionError::ApplicationClosed(_)) => break Ok(()),
+                    Err(e) => break Err(io::Error::other(e)),
+                },
+                // Reap completed splice tasks so the JoinSet never grows unboundedly.
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        };
+        // Abort any in-flight backend connects/splices immediately on session end.
+        tasks.abort_all();
+        // Flush CONNECTION_CLOSE on graceful shutdown so the server marks us offline right away.
+        if *shutdown.borrow() {
+            self.connection.close(0u32.into(), b"shutdown");
+            let _ =
+                tokio::time::timeout(Duration::from_millis(250), self.endpoint.wait_idle()).await;
+        }
+        result
+    }
+}
+
+pub(crate) async fn connect(
+    config: &TransportConfig,
+    base_tls: &rustls::ClientConfig,
+) -> io::Result<QuicSession> {
+    connect_with(config, client_config(base_tls.clone())?).await
 }
 
 async fn connect_with(
     config: &TransportConfig,
     client_config: ClientConfig,
 ) -> io::Result<QuicSession> {
-    let secret: [u8; 32] = hex::decode(&config.obfuscation_secret)
-        .ok()
-        .and_then(|bytes| bytes.try_into().ok())
+    let secret = x2rp_proto::obfs::decode_secret_hex(&config.obfuscation_secret)
         .ok_or_else(|| io::Error::other("invalid obfuscation secret"))?;
     let (server_name, _) = config.host_port()?;
     connect_any(config, |addr| {
@@ -95,18 +128,24 @@ async fn connect_to_addr(
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "QUIC handshake timed out"))?
         .map_err(io::Error::other)?;
 
-    let (mut control, _) = connection.open_bi().await.map_err(io::Error::other)?;
-    let auth = Message::Auth {
+    let auth_frame = Message::Auth {
         token: token.to_string(),
-    };
-    control
-        .write_all(&auth.frame()?)
-        .await
-        .map_err(io::Error::other)?;
-    let _ = control.finish();
+    }
+    .frame()?;
+    tokio::time::timeout(CONNECT_HEADER_TIMEOUT, async {
+        let (mut control, _) = connection.open_bi().await.map_err(io::Error::other)?;
+        control
+            .write_all(&auth_frame)
+            .await
+            .map_err(io::Error::other)?;
+        let _ = control.finish();
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "QUIC auth frame write timed out"))??;
 
     Ok(QuicSession {
-        _endpoint: endpoint,
+        endpoint,
         connection,
     })
 }
@@ -123,7 +162,15 @@ async fn splice_data_stream(mut send: SendStream, mut recv: RecvStream) {
             }
         };
 
-    let backend = connect_backend(&target).await;
+    // Abort backend dial immediately if the server resets/stops this stream.
+    let backend = tokio::select! {
+        biased;
+        _ = send.stopped() => {
+            tracing::debug!("QUIC tunnel {stream_id} cancelled before backend connect");
+            return;
+        }
+        res = connect_backend(&target) => res,
+    };
     let reply = match &backend {
         Ok(_) => Message::ConnectOk { stream_id },
         Err(e) => Message::ConnectErr {
@@ -160,7 +207,9 @@ fn client_config(mut tls: rustls::ClientConfig) -> io::Result<ClientConfig> {
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(io::Error::other)?,
     ));
-    client_config.transport_config(Arc::new(x2rp_proto::quic_transport_config()));
+    client_config.transport_config(Arc::new(x2rp_proto::quic_transport_config(
+        x2rp_proto::MAX_ACTIVE_STREAMS as u32,
+    )));
     Ok(client_config)
 }
 
@@ -255,13 +304,14 @@ mod tests {
         let config = TransportConfig {
             server: format!("https://127.0.0.1:{}", server_addr.port()),
             token: "test-token".to_string(),
-            obfuscation_secret: hex::encode(secret),
+            obfuscation_secret: x2rp_proto::encode_hex(&secret),
             force_wss: false,
         };
         let session = connect_with(&config, client_config(tls).expect("client config"))
             .await
             .expect("connect");
-        let run = tokio::spawn(session.run());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(session.run(shutdown_rx));
         server.await.expect("server");
         run.abort();
     }

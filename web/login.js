@@ -22,6 +22,7 @@ signin.addEventListener('submit', async event => {
   submit.disabled = false;
   problem.textContent = !response ? 'Could not reach the server.'
     : response.status === 429 ? 'Too many attempts. Wait a minute and try again.'
+    : response.status === 503 ? 'Server busy. Try again in a moment.'
     : 'Wrong password.';
   problem.hidden = false;
   password.select();

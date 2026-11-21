@@ -8,20 +8,18 @@ use axum::{
     Router,
     body::Body,
     extract::State,
-    http::{HeaderValue, Request, StatusCode, header},
+    http::Request,
     middleware,
     response::{IntoResponse, Redirect},
     routing::{get, post, put},
 };
-use clap::{Parser, Subcommand};
 use pingora_core::listeners::TcpSocketOptions;
 use pingora_core::listeners::tls::TlsSettings;
 use tokio::sync::RwLock;
-use tower_http::set_header::SetResponseHeaderLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use x2rp::api::{self, AppState, GlobalState};
 use x2rp::connector_manager::ConnectorRegistry;
-use x2rp::proxy::{Gateway, ProxyContext, ProxyResource, host_header_hostname};
+use x2rp::proxy::{Gateway, ProxyContext, ProxyResource, parse_host_header};
 use x2rp::{http_middleware, security_headers, static_files, tls, transport};
 
 #[global_allocator]
@@ -29,28 +27,56 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const SERVICE: &str = "x2rp";
 
-#[derive(Parser)]
-#[command(name = "x2rp", about = "x2rp reverse proxy")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Run the server (default)
+enum Command {
     Run,
-    /// Show service status
     Status,
-    /// Follow logs
     Logs,
 }
 
+fn usage() -> &'static str {
+    "Usage: x2rp [run|status|logs]\n\n\
+     x2rp reverse proxy\n\n\
+     Commands:\n  \
+       run     Run the server (default)\n  \
+       status  Show service status\n  \
+       logs    Follow logs\n"
+}
+
+fn parse_cli() -> Command {
+    let mut args = std::env::args().skip(1);
+    let Some(cmd) = args.next() else {
+        return Command::Run;
+    };
+    if args.next().is_some() {
+        eprintln!("Unexpected extra argument");
+        eprint!("{}", usage());
+        std::process::exit(2);
+    }
+    match cmd.as_str() {
+        "run" => Command::Run,
+        "status" => Command::Status,
+        "logs" => Command::Logs,
+        "help" | "-h" | "--help" => {
+            print!("{}", usage());
+            std::process::exit(0);
+        }
+        "-V" | "--version" => {
+            println!("x2rp {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        other => {
+            eprintln!("Unknown command: {other}");
+            eprint!("{}", usage());
+            std::process::exit(2);
+        }
+    }
+}
+
 fn main() {
-    let result = match Cli::parse().command.unwrap_or(Commands::Run) {
-        Commands::Run => run_server(),
-        Commands::Status => x2rp_proto::cmd_status(SERVICE).map_err(Into::into),
-        Commands::Logs => x2rp_proto::cmd_logs(SERVICE).map_err(Into::into),
+    let result = match parse_cli() {
+        Command::Run => run_server(),
+        Command::Status => x2rp_proto::cmd_status(SERVICE).map_err(Into::into),
+        Command::Logs => x2rp_proto::cmd_logs(SERVICE).map_err(Into::into),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");
@@ -130,8 +156,8 @@ async fn run_server() -> anyhow::Result<()> {
             "/resources/{id}",
             put(api::update_resource).delete(api::delete_resource),
         )
-        // No /auth/logout: admin sessions expire; operators clear cookies if needed.
         .route("/auth/login", post(api::auth_login))
+        // No /auth/logout: admin sessions expire; operators clear cookies if needed.
         .route(
             "/connector/connect",
             get(transport::websocket::connector_connect),
@@ -142,13 +168,12 @@ async fn run_server() -> anyhow::Result<()> {
             global_state.clone(),
             http_middleware::enforce_api_csrf,
         ))
-        .layer(SetResponseHeaderLayer::if_not_present(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
+        .layer(middleware::from_fn(
+            security_headers::api_no_store_middleware,
         ));
 
     // Served on loopback; the public edge proxies x2rp.<domain> to it.
-    let mut admin_app = Router::new()
+    let admin_app = Router::new()
         .nest("/api", api_routes)
         .fallback(
             |State(state): State<GlobalState>, req: Request<Body>| async move {
@@ -162,24 +187,25 @@ async fn run_server() -> anyhow::Result<()> {
             },
         )
         .with_state(global_state.clone())
-        // CSP is admin-app specific; the rest are the shared set the proxy path also applies.
-        .layer(SetResponseHeaderLayer::if_not_present(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(security_headers::ADMIN_APP_CSP),
+        .layer(middleware::from_fn(
+            security_headers::admin_security_headers_middleware,
         ));
-    for (name, value) in security_headers::STANDARD_RESPONSE_HEADERS {
-        admin_app = admin_app.layer(SetResponseHeaderLayer::if_not_present(
-            name,
-            HeaderValue::from_static(value),
-        ));
-    }
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    let (admin_stop_tx, mut admin_stop_rx) = tokio::sync::watch::channel(false);
     let admin_addr = SocketAddr::from(([127, 0, 0, 1], x2rp::proxy::ADMIN_API_PORT));
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
     tracing::info!("Admin API listening on {admin_addr}");
     let admin_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(admin_listener, admin_app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move {
+                let _ = admin_stop_rx.wait_for(|v| *v).await;
+            })
             .await
         {
             tracing::error!("Admin server error: {e}");
@@ -190,6 +216,8 @@ async fn run_server() -> anyhow::Result<()> {
     if !s.initialized || s.domain.is_empty() {
         tracing::warn!("Not initialized: run install.sh");
         drop(s);
+        let _ = shutdown_rx.wait_for(|v| *v).await;
+        let _ = admin_stop_tx.send(true);
         admin_handle.await?;
         return Ok(());
     }
@@ -215,7 +243,7 @@ async fn run_server() -> anyhow::Result<()> {
         .await
         .map_err(|e| e.context("TLS certificate provisioning failed"))?;
     // Shared by the HTTPS and QUIC listeners; a renewal swaps it in place.
-    let certs = tls::CertStore::load(tls::CERT_FILE, tls::KEY_FILE)
+    let certs = tls::CertStore::load(tls::CERT_FILE, tls::KEY_FILE, &domain)
         .map_err(|e| e.context("TLS certificate could not be loaded"))?;
     let tls_settings = || -> anyhow::Result<TlsSettings> {
         let mut settings = TlsSettings::intermediate(tls::CERT_FILE, tls::KEY_FILE)?;
@@ -247,6 +275,9 @@ async fn run_server() -> anyhow::Result<()> {
             http_service.add_tls_with_settings("[::]:443", Some(options), tls_settings()?);
             tracing::info!("Proxy listening on [::]:443 (dual-stack)");
         }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            anyhow::bail!("TCP port 443 is already in use: {e}");
+        }
         Err(e) => {
             tracing::warn!("Dual-stack bind failed ({e}), falling back to 0.0.0.0:443");
             http_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings()?);
@@ -254,6 +285,9 @@ async fn run_server() -> anyhow::Result<()> {
     }
     let redirect_listener = match bind_dual_stack_tcp((Ipv6Addr::UNSPECIFIED, 80).into()) {
         Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            anyhow::bail!("TCP port 80 is already in use: {e}");
+        }
         Err(e) => {
             tracing::warn!("Dual-stack bind failed ({e}), falling back to 0.0.0.0:80");
             tokio::net::TcpListener::bind("0.0.0.0:80").await?
@@ -262,24 +296,34 @@ async fn run_server() -> anyhow::Result<()> {
     server.add_service(http_service);
     tracing::info!("Admin UI: https://x2rp.{domain}");
 
-    // Server::run_forever is `-> !`: it ends in its own process::exit.
-    tokio::task::spawn_blocking(move || server.run_forever());
+    // `Server::run` returns cleanly once Pingora's grace period and shutdown timeout finish.
+    let pingora_handle =
+        tokio::task::spawn_blocking(move || server.run(pingora_core::server::RunArgs::default()));
     tokio::spawn(run_http_redirect(redirect_listener, domain));
 
-    let secret = hex::decode(&obfuscation_secret)
-        .ok()
-        .and_then(|secret| <[u8; 32]>::try_from(secret).ok());
-    match secret.map(|secret| transport::quic::create_quic_endpoint(certs.clone(), secret)) {
-        Some(Ok(endpoint)) => {
-            tracing::info!("QUIC endpoint ready on UDP {}", transport::quic::QUIC_PORT);
-            tokio::spawn(transport::quic::quic_accept_loop(endpoint, global_state));
-        }
-        Some(Err(e)) => tracing::warn!(
-            "QUIC endpoint failed (UDP {}): {e}",
-            transport::quic::QUIC_PORT
-        ),
-        None => tracing::error!("Invalid obfuscation_secret; QUIC transport disabled"),
-    }
+    let secret = x2rp_proto::obfs::decode_secret_hex(&obfuscation_secret);
+    let quic_endpoint =
+        match secret.map(|secret| transport::quic::create_quic_endpoint(certs.clone(), secret)) {
+            Some(Ok(endpoint)) => {
+                tracing::info!("QUIC endpoint ready on UDP {}", transport::quic::QUIC_PORT);
+                tokio::spawn(transport::quic::quic_accept_loop(
+                    endpoint.clone(),
+                    global_state,
+                ));
+                Some(endpoint)
+            }
+            Some(Err(e)) => {
+                tracing::warn!(
+                    "QUIC endpoint failed (UDP {}): {e}",
+                    transport::quic::QUIC_PORT
+                );
+                None
+            }
+            None => {
+                tracing::error!("Invalid obfuscation_secret; QUIC transport disabled");
+                None
+            }
+        };
 
     // A renewed cert goes into service in place; a restart is the fallback only if it
     // cannot be loaded.
@@ -307,7 +351,15 @@ async fn run_server() -> anyhow::Result<()> {
         }
     });
 
-    admin_handle.await?;
+    let _ = shutdown_rx.wait_for(|v| *v).await;
+    // Drain Pingora first so in-flight proxied/relayed requests finish before QUIC & admin stop.
+    let _ = pingora_handle.await;
+    if let Some(endpoint) = quic_endpoint {
+        endpoint.close(0u32.into(), b"shutdown");
+        let _ = tokio::time::timeout(Duration::from_millis(250), endpoint.wait_idle()).await;
+    }
+    let _ = admin_stop_tx.send(true);
+    let _ = admin_handle.await;
     Ok(())
 }
 
@@ -333,30 +385,212 @@ async fn shutdown_signal() {
     tracing::info!("Shutdown signal received");
 }
 
-/// HTTP :80 → HTTPS for the configured domain and its subdomains; anything else is a 400.
+/// Where a :80 request for Host `raw` is redirected: the domain or a single-label
+/// subdomain, spelled as a valid hostname, so malformed Host values or off-site
+/// domains cannot turn the redirect into an open redirect.
+fn redirect_host(raw: &str, domain: &str) -> Option<String> {
+    let host = parse_host_header(raw)?.to_ascii_lowercase();
+    let ours = host == domain
+        || host
+            .strip_suffix(domain)
+            .and_then(|p| p.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty() && !label.contains('.'));
+    (ours && api::is_valid_domain(&host)).then_some(host)
+}
+
+/// Bounded HTTP/1.1 :80 → HTTPS :443 redirect server.
+///
+/// Enforces a strict header read timeout (5s), 8 KiB header cap, concurrency cap
+/// (256), and `Connection: close` so Slowloris or header-flood attacks cannot hold
+/// sockets or tasks open indefinitely.
 async fn run_http_redirect(listener: tokio::net::TcpListener, domain: String) {
-    let app = Router::new().fallback(move |req: Request<Body>| {
-        let suffix = format!(".{domain}");
-        // A valid hostname only: `evil.com/.example.com` must not become a redirect.
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .map(|raw| host_header_hostname(raw).to_ascii_lowercase())
-            .filter(|host| {
-                (*host == domain || host.ends_with(&suffix)) && api::is_valid_domain(host)
-            });
-        let path = req
-            .uri()
-            .path_and_query()
-            .map_or("/", axum::http::uri::PathAndQuery::as_str);
-        let response = match host {
-            None => StatusCode::BAD_REQUEST.into_response(),
-            Some(host) => Redirect::permanent(&format!("https://{host}{path}")).into_response(),
+    const MAX_CONNS: usize = 256;
+    const IO_TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_HEADER_BYTES: usize = 8 * 1024;
+
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    let domain = Arc::new(domain);
+
+    loop {
+        let (mut io, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!("HTTP redirect accept error: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
         };
-        async move { response }
-    });
-    if let Err(e) = axum::serve(listener, app).await {
-        tracing::error!("HTTP redirect server error: {e}");
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            tracing::debug!("HTTP :80 concurrency cap reached; dropping {}", addr.ip());
+            continue;
+        };
+        let domain = Arc::clone(&domain);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let _permit = permit;
+            let mut buf = Vec::with_capacity(512);
+            let mut tmp = [0u8; 1024];
+            let read_res = tokio::time::timeout(IO_TIMEOUT, async {
+                loop {
+                    let room = MAX_HEADER_BYTES.saturating_sub(buf.len());
+                    if room == 0 {
+                        return Ok::<bool, std::io::Error>(false);
+                    }
+                    let cap = room.min(tmp.len());
+                    let n = io.read(&mut tmp[..cap]).await?;
+                    if n == 0 {
+                        return Ok(false);
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        return Ok(true);
+                    }
+                }
+            })
+            .await;
+
+            let response = match read_res {
+                Ok(Ok(true)) => build_http_redirect_response(&buf, &domain, addr.ip()),
+                Ok(Ok(false)) if !buf.is_empty() => {
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        .to_vec()
+                }
+                _ => return,
+            };
+            let _ = tokio::time::timeout(IO_TIMEOUT, async {
+                io.write_all(&response).await?;
+                io.shutdown().await
+            })
+            .await;
+        });
+    }
+}
+
+fn build_http_redirect_response(raw: &[u8], domain: &str, peer_ip: std::net::IpAddr) -> Vec<u8> {
+    const BAD_REQUEST: &[u8] =
+        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+    let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return BAD_REQUEST.to_vec();
+    };
+    let Ok(head) = std::str::from_utf8(&raw[..header_end]) else {
+        return BAD_REQUEST.to_vec();
+    };
+    let mut lines = head.split("\r\n");
+    let Some(req_line) = lines.next() else {
+        return BAD_REQUEST.to_vec();
+    };
+    // Reject bare CR or LF inside any line (request smuggling / log injection).
+    if req_line.contains(['\r', '\n']) {
+        return BAD_REQUEST.to_vec();
+    }
+    let mut req_parts = req_line.split(' ');
+    let (Some(method), Some(target), Some(version), None) = (
+        req_parts.next(),
+        req_parts.next(),
+        req_parts.next(),
+        req_parts.next(),
+    ) else {
+        return BAD_REQUEST.to_vec();
+    };
+    if !(1..=16).contains(&method.len())
+        || !method.bytes().all(|b| b.is_ascii_uppercase())
+        || !matches!(version, "HTTP/1.1" | "HTTP/1.0")
+        || !target.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return BAD_REQUEST.to_vec();
+    }
+
+    let mut host: Option<&str> = None;
+    for line in lines {
+        if line.contains(['\r', '\n']) {
+            return BAD_REQUEST.to_vec();
+        }
+        let Some((name, val)) = line.split_once(':') else {
+            return BAD_REQUEST.to_vec();
+        };
+        if name.eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return BAD_REQUEST.to_vec();
+            }
+            host = Some(val.trim_ascii());
+        }
+    }
+
+    let Some(host) = host.and_then(|raw_host| redirect_host(raw_host, domain)) else {
+        return BAD_REQUEST.to_vec();
+    };
+    let path = if target.starts_with('/') && !target.starts_with("//") {
+        target
+    } else {
+        "/"
+    };
+    tracing::debug!("{peer_ip} {method} http://{host}{path} 308");
+    format!(
+        "HTTP/1.1 308 Permanent Redirect\r\nLocation: https://{host}{path}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn redirect_host_allows_apex_and_single_label_subdomains_only() {
+        assert_eq!(
+            redirect_host("example.com", "example.com").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            redirect_host("APP.example.com:80", "example.com").as_deref(),
+            Some("app.example.com")
+        );
+        for bad in [
+            "a.b.example.com",
+            "evil.com",
+            "evil.com/.example.com",
+            "notexample.com",
+            "app.example.com ",
+            "",
+        ] {
+            assert_eq!(redirect_host(bad, "example.com"), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn http_redirect_builds_308_or_400() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let ok = String::from_utf8(build_http_redirect_response(
+            b"GET /hello?a=1 HTTP/1.1\r\nHost: app.example.com\r\n\r\n",
+            "example.com",
+            ip,
+        ))
+        .unwrap();
+        assert!(ok.starts_with("HTTP/1.1 308 Permanent Redirect\r\n"));
+        assert!(ok.contains("Location: https://app.example.com/hello?a=1\r\n"));
+        assert!(ok.contains("Connection: close\r\n"));
+
+        // Scheme-relative target must collapse to `/` rather than redirect off-site.
+        let slash = String::from_utf8(build_http_redirect_response(
+            b"GET //evil.com HTTP/1.1\r\nHost: app.example.com\r\n\r\n",
+            "example.com",
+            ip,
+        ))
+        .unwrap();
+        assert!(slash.contains("Location: https://app.example.com/\r\n"));
+
+        // Duplicate Host, unknown Host, bare LF in method, or non-ASCII target gets 400.
+        for bad in [
+            b"GET / HTTP/1.1\r\nHost: evil.com\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: app.example.com\r\nHost: app.example.com\r\n\r\n",
+            b"GET\nFAKE / HTTP/1.1\r\nHost: app.example.com\r\n\r\n",
+            "GET /café HTTP/1.1\r\nHost: app.example.com\r\n\r\n".as_bytes(),
+        ] {
+            let resp =
+                String::from_utf8(build_http_redirect_response(bad, "example.com", ip)).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{resp}");
+        }
     }
 }

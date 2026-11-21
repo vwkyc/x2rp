@@ -18,6 +18,26 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 const IV_LEN: usize = 12;
 
+/// Decode a 64-char hex string into a 32-byte QUIC obfuscation secret.
+pub fn decode_secret_hex(s: &str) -> Option<[u8; 32]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; 32];
+    let (pairs, _) = bytes.as_chunks::<2>();
+    for (slot, pair) in out.iter_mut().zip(pairs) {
+        *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(out)
+}
+
 /// Quinn MTU discovery upper bound reduced by [`IV_LEN`] so QUIC + IV fits Ethernet (1452B).
 pub(crate) const MTU_DISCOVERY_UPPER_BOUND: u16 = 1452 - IV_LEN as u16;
 
@@ -88,7 +108,7 @@ fn encode_transmit<'a>(
 }
 
 fn decrypt_meta_payload(buf: &mut [u8], meta: &mut RecvMeta, secret: &[u8; 32]) -> io::Result<()> {
-    if meta.len == 0 || meta.stride <= IV_LEN {
+    if meta.len == 0 || meta.len > buf.len() || meta.stride <= IV_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "obfuscated datagram is too small",
@@ -163,6 +183,9 @@ impl AsyncUdpSocket for ObfuscatedSocket {
             &mut bufs[..max_packets],
             &mut meta[..max_packets]
         ))?;
+        if packet_count == 0 {
+            return Poll::Ready(Ok(0));
+        }
         let mut valid_count = 0usize;
         for index in 0..packet_count {
             if decrypt_meta_payload(&mut bufs[index], &mut meta[index], &self.secret).is_ok() {
@@ -299,5 +322,17 @@ mod tests {
         let out = encode_transmit(&zero_seg, &TEST_SECRET, &mut encoded);
         assert_eq!(out.contents.len(), b"payload".len() + IV_LEN);
         assert!(out.segment_size.is_none());
+    }
+
+    #[test]
+    fn secret_hex_roundtrips_and_rejects_invalid() {
+        let encoded = crate::encode_hex(&TEST_SECRET);
+        assert_eq!(decode_secret_hex(&encoded), Some(TEST_SECRET));
+        assert_eq!(
+            decode_secret_hex(&encoded.to_ascii_uppercase()),
+            Some(TEST_SECRET)
+        );
+        assert_eq!(decode_secret_hex("short"), None);
+        assert_eq!(decode_secret_hex(&"z".repeat(64)), None);
     }
 }
