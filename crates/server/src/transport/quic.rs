@@ -42,18 +42,22 @@ pub fn create_quic_endpoint(
     let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
     // Connectors only ever initiate one bidi stream (the initial Auth frame).
     server_config.transport_config(Arc::new(x2rp_proto::quic_transport_config(1)));
+    server_config.max_incoming(MAX_CONCURRENT_HANDSHAKES);
 
-    let socket = ObfuscatedSocket::bind(
+    let socket = match ObfuscatedSocket::bind(
         (Ipv6Addr::UNSPECIFIED, QUIC_PORT).into(),
         obfuscation_secret,
-    )
-    .or_else(|e| {
-        warn!("IPv6 QUIC bind unavailable ({e}), falling back to 0.0.0.0:{QUIC_PORT}");
-        ObfuscatedSocket::bind(
-            (Ipv4Addr::UNSPECIFIED, QUIC_PORT).into(),
-            obfuscation_secret,
-        )
-    })?;
+    ) {
+        Ok(socket) => socket,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Err(e),
+        Err(e) => {
+            warn!("IPv6 QUIC bind unavailable ({e}), falling back to 0.0.0.0:{QUIC_PORT}");
+            ObfuscatedSocket::bind(
+                (Ipv4Addr::UNSPECIFIED, QUIC_PORT).into(),
+                obfuscation_secret,
+            )?
+        }
+    };
     Endpoint::new_with_abstract_socket(
         Default::default(),
         Some(server_config),

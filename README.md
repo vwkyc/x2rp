@@ -37,8 +37,9 @@ domain and its single-label subdomains to HTTPS with `Connection: close`, and
 answers anything else with `400`.
 
 Origins receive `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`,
-`X-Forwarded-Host` and `X-Request-Id` set by the proxy, and any client-supplied
-`Forwarded` header is removed. Responses carry an `X-Request-Id`, always
+`X-Forwarded-Port`, `X-Forwarded-Host` and `X-Request-Id` set by the proxy, and
+any client-supplied `Forwarded` or `X-Scheme` header is removed. Responses carry
+an `X-Request-Id`, always
 enforce HSTS and `X-Content-Type-Options`, and add `Referrer-Policy` and
 `X-Frame-Options` where the origin did not set them. The console itself is
 served through the same edge from the admin API on `127.0.0.1:8800`.
@@ -115,7 +116,7 @@ session.
 Upstream addresses are checked where they are dialled. Routes on the server
 must resolve to loopback, rechecked on every connection so DNS rebinding
 cannot redirect them. Connectors refuse link-local, multicast, broadcast and
-cloud metadata addresses (AWS, GCP, Azure, Alibaba), including their
+cloud metadata addresses (AWS, GCP, Azure, Alibaba, Oracle), including their
 IPv4-mapped and NAT64 forms.
 
 State, the TLS key and the ACME account are written with mode 0600, and the
@@ -168,7 +169,7 @@ curl -fsSL https://github.com/vwkyc/x2rp/releases/latest/download/install.sh | s
 
 The installer downloads the release binary for the host architecture. A
 first install prompts for the base domain (e.g. `example.com`), an admin
-password (12 to 128 characters) and the Cloudflare token, which is checked
+password (12 to 128 bytes) and the Cloudflare token, which is checked
 against the zone. Run the same command again to upgrade. To uninstall and
 delete all data:
 
@@ -206,7 +207,7 @@ on the private host. The token is shown once. The command installs the
 connector version matching the server:
 
 ```sh
-curl -fsSL https://github.com/vwkyc/x2rp/releases/download/v1.1.0/install-connector.sh | sudo bash -s -- --server https://x2rp.example.com --token '<token>'
+curl -fsSL https://github.com/vwkyc/x2rp/releases/download/v1.1.1/install-connector.sh | sudo bash -s -- --server https://x2rp.example.com --token '<token>'
 ```
 
 Keep connectors on the server's version. After upgrading the server, run the

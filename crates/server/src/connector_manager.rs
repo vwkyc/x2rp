@@ -131,14 +131,6 @@ impl ConnectorManager {
         }
     }
 
-    /// Bridge a connection stream to the connector.
-    pub fn bridge<S>(self: &Arc<Self>, target: &str, stream: S) -> Result<(), String>
-    where
-        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-    {
-        self.bridge_cancellable(target, stream, None)
-    }
-
     /// Bridge a connection stream to the connector, aborting the tunnel immediately
     /// when `cancel` resolves (e.g. Pingora drops its end of `RelayPipe`).
     pub fn bridge_cancellable<S>(
@@ -486,10 +478,6 @@ pub struct ConnectorRegistry {
 }
 
 impl ConnectorRegistry {
-    pub fn register(&self, manager: Arc<ConnectorManager>) {
-        self.try_register(manager, usize::MAX);
-    }
-
     /// True if `connector_id` can be registered without exceeding `max_sessions`
     /// (replacing an already-connected session for the same ID is always allowed).
     pub fn can_register(&self, connector_id: &str, max_sessions: usize) -> bool {
@@ -596,7 +584,7 @@ mod tests {
     ) -> (u32, tokio::io::DuplexStream) {
         let (peer_end, stream) = duplex(buf);
         manager
-            .bridge("http://example.internal", stream)
+            .bridge_cancellable("http://example.internal", stream, None)
             .expect("bridge should start");
         let stream_id = next_matching(rx, |m| match m {
             Message::Connect { stream_id, .. } => Some(stream_id),
@@ -755,11 +743,15 @@ mod tests {
         let (manager, _rx) = test_manager(MAX_ACTIVE_STREAMS + 1);
         for _ in 0..MAX_ACTIVE_STREAMS {
             let (_peer_end, stream) = duplex(1);
-            assert!(manager.bridge("http://example.internal", stream).is_ok());
+            assert!(
+                manager
+                    .bridge_cancellable("http://example.internal", stream, None)
+                    .is_ok()
+            );
         }
         let (_peer_end, stream) = duplex(1);
         let err = manager
-            .bridge("http://example.internal", stream)
+            .bridge_cancellable("http://example.internal", stream, None)
             .expect_err("connector should reject streams beyond the cap");
         assert!(err.contains("active stream cap"));
     }
@@ -776,15 +768,15 @@ mod tests {
         let registry = ConnectorRegistry::default();
         let (old_manager, new_manager) = (manager(), manager());
 
-        registry.register(old_manager.clone());
-        registry.register(new_manager.clone());
+        assert!(registry.try_register(old_manager.clone(), usize::MAX));
+        assert!(registry.try_register(new_manager.clone(), usize::MAX));
         registry.unregister_manager(&old_manager);
         let current = registry.get("same-id").expect("replacement should remain");
         assert!(Arc::ptr_eq(&current, &new_manager));
 
         registry.unregister_manager(&new_manager);
         assert!(registry.get("same-id").is_none());
-        registry.register(old_manager);
+        assert!(registry.try_register(old_manager, usize::MAX));
         registry.unregister("same-id");
         assert!(registry.get("same-id").is_none());
     }
@@ -838,7 +830,7 @@ mod tests {
 
         let (mut client, stream) = duplex(64);
         manager
-            .bridge("http://example.internal", stream)
+            .bridge_cancellable("http://example.internal", stream, None)
             .expect("bridge should start");
         client.write_all(b"hello").await.expect("write");
         let mut echo = [0u8; 5];

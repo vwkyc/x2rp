@@ -21,6 +21,9 @@ const NANOS_PER_MINUTE: u64 = 60_000_000_000;
 /// Process-local monotonic origin for GCRA nanosecond timestamps (~584 years in `u64`).
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// Per-process random seed so attackers cannot precompute colliding keys for one shard.
+static SHARD_SEED: LazyLock<u64> = LazyLock::new(rand::random);
+
 /// Monotonic seconds offset above zero so initial entries are strictly > 0 and the
 /// first capacity-triggered expiry sweep is never blocked by `last_cleanup_secs == 0`.
 const MONOTONIC_SECS_OFFSET: u64 = 3_600;
@@ -40,10 +43,16 @@ pub enum ClientKey {
 
 impl ClientKey {
     fn shard_index(self) -> usize {
+        let seed = *SHARD_SEED;
         let mix = match self {
-            Self::V4(v4) => (u32::from(v4).wrapping_mul(0x9e37_79b9) >> 28) as usize,
-            Self::V6Prefix(prefix) => (prefix.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 60) as usize,
-            Self::Unknown => 0,
+            Self::V4(v4) => {
+                ((u64::from(u32::from(v4)) ^ seed).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 60)
+                    as usize
+            }
+            Self::V6Prefix(prefix) => {
+                ((prefix ^ seed).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 60) as usize
+            }
+            Self::Unknown => (seed >> 60) as usize,
         };
         mix & (SHARDS - 1)
     }
@@ -113,7 +122,6 @@ impl RateTier {
             tat_ns: AtomicU64::new(0),
             last_seen_secs: AtomicU64::new(now_secs),
         });
-        entry.last_seen_secs.store(now_secs, Ordering::Relaxed);
         self.try_consume(entry, now_ns)
     }
 

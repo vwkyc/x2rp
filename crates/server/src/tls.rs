@@ -441,7 +441,7 @@ impl CertStore {
         Ok(())
     }
 
-    pub fn current(&self) -> std::sync::Arc<rustls::sign::CertifiedKey> {
+    fn current(&self) -> std::sync::Arc<rustls::sign::CertifiedKey> {
         self.current.read().clone()
     }
 

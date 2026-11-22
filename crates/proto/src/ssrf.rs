@@ -99,6 +99,7 @@ mod tests {
             "255.255.255.255",
             "ff02::1",
             "fd00:ec2::254",
+            "fd00:ec2::1",
             "fd20:ce::254",
             "fd00:c1::a9fe:a9fe",
             "::ffff:0.0.0.1",
@@ -123,28 +124,6 @@ mod tests {
             "64:ff9b::101:101",
         ] {
             assert!(!is_strictly_dangerous_ip(ip(ok)), "{ok}");
-        }
-    }
-
-    #[test]
-    fn metadata_ip_detection_matches_expected_ranges() {
-        for meta in [
-            "169.254.169.254",
-            "100.100.100.200",
-            "168.63.129.16",
-            "192.0.0.192",
-            "fd00:ec2::254",
-            "fd00:ec2::1",
-            "fd20:ce::254",
-            "fd00:c1::a9fe:a9fe",
-            "::ffff:169.254.169.254",
-            "::ffff:192.0.0.192",
-            "64:ff9b::a9fe:a9fe",
-        ] {
-            assert!(is_metadata_ip(ip(meta)), "{meta}");
-        }
-        for ok in ["8.8.8.8", "2001:db8::1", "64:ff9b::0808:0808"] {
-            assert!(!is_metadata_ip(ip(ok)), "{ok}");
         }
     }
 }

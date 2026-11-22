@@ -91,34 +91,42 @@ struct ServerSettings {
     force_wss: bool,
 }
 
-fn max_log_level() -> tracing::Level {
+fn parse_log_filter(raw: Option<&str>) -> tracing_subscriber::filter::Targets {
     let default = if cfg!(debug_assertions) {
         tracing::Level::DEBUG
     } else {
         tracing::Level::INFO
     };
-    std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|raw| {
-            raw.split(',')
-                .find_map(|p| {
-                    let p = p.trim();
-                    p.strip_prefix("x2rp_connector=")
-                        .or_else(|| (!p.contains('=')).then_some(p))
-                })
-                .and_then(|lvl| lvl.parse().ok())
-        })
-        .unwrap_or(default)
+    let fallback =
+        || tracing_subscriber::filter::Targets::new().with_target("x2rp_connector", default);
+    raw.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+    .filter(|s| !s.is_empty())
+    .and_then(|s| s.parse().ok())
+    .unwrap_or_else(fallback)
+}
+
+fn log_filter() -> tracing_subscriber::filter::Targets {
+    parse_log_filter(std::env::var("RUST_LOG").ok().as_deref())
 }
 
 #[tokio::main]
 async fn main() {
     let command = parse_cli();
 
-    tracing_subscriber::fmt()
-        .without_time()
-        .with_target(false)
-        .with_max_level(max_log_level())
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(log_filter())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_target(false),
+        )
         .init();
 
     rustls::crypto::ring::default_provider()
@@ -310,7 +318,10 @@ fn load_config() -> Result<Config> {
 fn normalize_server_origin(server: &str) -> Result<String> {
     let normalized = server.trim().trim_end_matches('/');
     match x2rp_proto::parse_http_origin(normalized) {
-        Ok((_, _, true)) => Ok(normalized.to_string()),
+        Ok((_, _, true)) => {
+            let rest = normalized.split_once("://").map_or(normalized, |(_, r)| r);
+            Ok(format!("https://{rest}"))
+        }
         _ => Err("Config error: server must be a bare HTTPS origin (https://host[:port])".into()),
     }
 }
@@ -333,9 +344,38 @@ mod tests {
 
     #[test]
     fn server_origin_must_be_bare_https() {
-        assert!(super::normalize_server_origin("https://x2rp.example.com/").is_ok());
+        assert_eq!(
+            super::normalize_server_origin("HTTPS://x2rp.example.com/").unwrap(),
+            "https://x2rp.example.com"
+        );
         for bad in ["http://h", "https://", "https://h/p", "https://u@h"] {
             assert!(super::normalize_server_origin(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_log_filter_scopes_directives_and_falls_back() {
+        use tracing::Level;
+        use tracing_subscriber::filter::LevelFilter;
+
+        let scoped = super::parse_log_filter(Some(" x2rp_connector=debug , "));
+        assert!(scoped.would_enable("x2rp_connector", &Level::DEBUG));
+        assert!(!scoped.would_enable("quinn_proto", &Level::INFO));
+
+        let multi = super::parse_log_filter(Some("warn, x2rp_connector=debug"));
+        assert!(multi.would_enable("x2rp_connector", &Level::DEBUG));
+        assert!(!multi.would_enable("quinn_proto", &Level::INFO));
+        assert!(multi.would_enable("quinn_proto", &Level::WARN));
+
+        assert_eq!(
+            super::parse_log_filter(Some("off")).default_level(),
+            Some(LevelFilter::OFF)
+        );
+
+        for raw in [None, Some(""), Some(" , "), Some("not_a_level=bogus")] {
+            let fallback = super::parse_log_filter(raw);
+            assert!(fallback.would_enable("x2rp_connector", &Level::INFO));
+            assert!(!fallback.would_enable("quinn_proto", &Level::INFO));
         }
     }
 }

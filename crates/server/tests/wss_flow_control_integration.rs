@@ -129,7 +129,7 @@ async fn slow_reader_download_completes_via_window_updates() {
 
     let (mut peer_end, downstream) = tokio::io::duplex(64 * 1024);
     manager
-        .bridge("http://origin.internal:80", downstream)
+        .bridge_cancellable("http://origin.internal:80", downstream, None)
         .expect("bridge should start");
 
     let stream_id = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())

@@ -77,6 +77,8 @@ where
 }
 
 /// Minimal bounded HTTPS/1.1 GET (no redirects) for `/api/connector/settings`.
+/// Only speaks to our own Pingora/Axum server over verified TLS with a hardcoded path,
+/// so full RFC 9112 smuggling / arbitrary-input hardening is intentionally omitted.
 pub(crate) async fn https_get(
     config: &TransportConfig,
     path: &str,

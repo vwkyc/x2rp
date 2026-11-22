@@ -202,8 +202,9 @@ UNIT
     done
 
     if [[ $SETUP == true ]]; then
-        code=$(jq -n --arg domain "$DOMAIN" --arg admin_password "$ADMIN_PASSWORD" \
-                --arg cf_api_token "$CF_API_TOKEN" '{$domain, $admin_password, $cf_api_token}' |
+        # Pass secrets on stdin (never as jq --arg) so they stay out of the process list.
+        code=$(printf '%s\n%s\n%s' "$DOMAIN" "$ADMIN_PASSWORD" "$CF_API_TOKEN" |
+            jq -Rs 'split("\n") as $v | {domain: $v[0], admin_password: $v[1], cf_api_token: $v[2]}' |
             curl -sS -o /dev/null -w '%{http_code}' -X POST "$API/api/setup" \
                 -H 'Content-Type: application/json' --data-binary @-) || true
         unset ADMIN_PASSWORD CF_API_TOKEN

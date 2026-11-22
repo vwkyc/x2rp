@@ -126,16 +126,6 @@ async fn validate_target(target: &str, connector_id: Option<&str>) -> Result<(),
     })
 }
 
-fn publish(state: &GlobalState, resource: &Resource) {
-    if resource.enabled {
-        state
-            .proxy_ctx
-            .set_resource(ProxyResource::from_resource(resource));
-    } else {
-        state.proxy_ctx.remove_resource(&resource.subdomain);
-    }
-}
-
 pub async fn list_resources(
     State(state): State<GlobalState>,
     headers: HeaderMap,
@@ -195,7 +185,9 @@ pub async fn create_resource(
         tracing::error!("Failed to save resource {}: {}", resource.id, e);
         return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
     }
-    publish(&state, &resource);
+    state
+        .proxy_ctx
+        .set_resource(ProxyResource::from_resource(&resource));
     tracing::info!("Created resource: {}.{}", resource.subdomain, s.domain);
     Ok(Json(resource))
 }

@@ -547,6 +547,7 @@ mod tests {
         for raw in [
             &[MessageType::Data as u8, 0, 0, 0, 1, 0, 0, 0, 0][..],
             &[MessageType::WindowUpdate as u8, 0, 0, 0, 1, 0, 0, 0, 0][..],
+            &[MessageType::Connect as u8, 0, 0, 0, 1, 0, 0][..],
         ] {
             assert!(Message::decode(Bytes::copy_from_slice(raw)).is_err());
         }

@@ -259,6 +259,7 @@ mod tests {
                 let mut sessions = auth.admin_sessions.write();
                 let session = sessions.get_mut(&sid).expect("session");
                 let now = Instant::now();
+                // Linux-only: `Timespec.tv_sec` is signed `i64`, so subtracting past boot cannot underflow.
                 session.created_at = now - Duration::from_secs(created_ago);
                 session.last_access = now - Duration::from_secs(idle_for);
             }

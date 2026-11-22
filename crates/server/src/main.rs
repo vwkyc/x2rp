@@ -191,10 +191,10 @@ async fn run_server() -> anyhow::Result<()> {
             security_headers::admin_security_headers_middleware,
         ));
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel::<Option<StopKind>>(None);
     tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = shutdown_tx.send(true);
+        let kind = shutdown_signal().await;
+        let _ = shutdown_tx.send(Some(kind));
     });
 
     let (admin_stop_tx, mut admin_stop_rx) = tokio::sync::watch::channel(false);
@@ -216,9 +216,9 @@ async fn run_server() -> anyhow::Result<()> {
     if !s.initialized || s.domain.is_empty() {
         tracing::warn!("Not initialized: run install.sh");
         drop(s);
-        let _ = shutdown_rx.wait_for(|v| *v).await;
+        let _ = shutdown_rx.wait_for(|v| v.is_some()).await;
         let _ = admin_stop_tx.send(true);
-        admin_handle.await?;
+        let _ = tokio::time::timeout(Duration::from_secs(3), admin_handle).await;
         return Ok(());
     }
     let domain = s.domain.clone();
@@ -296,9 +296,20 @@ async fn run_server() -> anyhow::Result<()> {
     server.add_service(http_service);
     tracing::info!("Admin UI: https://x2rp.{domain}");
 
+    if shutdown_rx.borrow().is_some() {
+        let _ = admin_stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(3), admin_handle).await;
+        return Ok(());
+    }
+
     // `Server::run` returns cleanly once Pingora's grace period and shutdown timeout finish.
-    let pingora_handle =
-        tokio::task::spawn_blocking(move || server.run(pingora_core::server::RunArgs::default()));
+    // Drive Pingora from our watch channel so a signal arriving during startup is never missed.
+    let pingora_shutdown_rx = shutdown_rx.clone();
+    let mut pingora_handle = tokio::task::spawn_blocking(move || {
+        server.run(pingora_core::server::RunArgs {
+            shutdown_signal: Box::new(WatchShutdown(pingora_shutdown_rx)),
+        })
+    });
     tokio::spawn(run_http_redirect(redirect_listener, domain));
 
     let secret = x2rp_proto::obfs::decode_secret_hex(&obfuscation_secret);
@@ -351,15 +362,26 @@ async fn run_server() -> anyhow::Result<()> {
         }
     });
 
-    let _ = shutdown_rx.wait_for(|v| *v).await;
-    // Drain Pingora first so in-flight proxied/relayed requests finish before QUIC & admin stop.
-    let _ = pingora_handle.await;
+    let mut unexpected_exit = false;
+    tokio::select! {
+        _ = shutdown_rx.wait_for(|v| v.is_some()) => {
+            // Drain Pingora first so in-flight proxied/relayed requests finish before QUIC & admin stop.
+            let _ = pingora_handle.await;
+        }
+        _ = &mut pingora_handle => {
+            tracing::error!("Pingora proxy exited unexpectedly");
+            unexpected_exit = true;
+        }
+    }
     if let Some(endpoint) = quic_endpoint {
         endpoint.close(0u32.into(), b"shutdown");
         let _ = tokio::time::timeout(Duration::from_millis(250), endpoint.wait_idle()).await;
     }
     let _ = admin_stop_tx.send(true);
-    let _ = admin_handle.await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), admin_handle).await;
+    if unexpected_exit {
+        anyhow::bail!("Pingora proxy exited unexpectedly");
+    }
     Ok(())
 }
 
@@ -374,15 +396,37 @@ fn bind_dual_stack_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListe
     tokio::net::TcpListener::from_std(socket.into())
 }
 
-async fn shutdown_signal() {
+#[derive(Clone, Copy)]
+enum StopKind {
+    Graceful,
+    Fast,
+}
+
+struct WatchShutdown(tokio::sync::watch::Receiver<Option<StopKind>>);
+
+#[async_trait::async_trait]
+impl pingora_core::server::ShutdownSignalWatch for WatchShutdown {
+    async fn recv(&self) -> pingora_core::server::ShutdownSignal {
+        let mut rx = self.0.clone();
+        match rx.wait_for(|v| v.is_some()).await.ok().and_then(|v| *v) {
+            Some(StopKind::Fast) => pingora_core::server::ShutdownSignal::FastShutdown,
+            Some(StopKind::Graceful) | None => {
+                pingora_core::server::ShutdownSignal::GracefulTerminate
+            }
+        }
+    }
+}
+
+async fn shutdown_signal() -> StopKind {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut term = signal(SignalKind::terminate()).expect("register SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
-        _ = term.recv() => {},
-    }
+    let kind = tokio::select! {
+        _ = tokio::signal::ctrl_c() => StopKind::Fast,
+        _ = term.recv() => StopKind::Graceful,
+    };
     tracing::info!("Shutdown signal received");
+    kind
 }
 
 /// Where a :80 request for Host `raw` is redirected: the domain or a single-label
@@ -428,20 +472,22 @@ async fn run_http_redirect(listener: tokio::net::TcpListener, domain: String) {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let _permit = permit;
-            let mut buf = Vec::with_capacity(512);
-            let mut tmp = [0u8; 1024];
+            const READ_CHUNK: usize = 1024;
+            let mut buf = Vec::with_capacity(READ_CHUNK);
             let read_res = tokio::time::timeout(IO_TIMEOUT, async {
                 loop {
-                    let room = MAX_HEADER_BYTES.saturating_sub(buf.len());
+                    let old = buf.len();
+                    let room = MAX_HEADER_BYTES.saturating_sub(old);
                     if room == 0 {
                         return Ok::<bool, std::io::Error>(false);
                     }
-                    let cap = room.min(tmp.len());
-                    let n = io.read(&mut tmp[..cap]).await?;
-                    if n == 0 {
+                    let cap = room.min(READ_CHUNK);
+                    buf.resize(old + cap, 0);
+                    let res = io.read(&mut buf[old..]).await;
+                    buf.truncate(old + res.as_ref().copied().unwrap_or(0));
+                    if res? == 0 {
                         return Ok(false);
                     }
-                    buf.extend_from_slice(&tmp[..n]);
                     if buf.windows(4).any(|w| w == b"\r\n\r\n") {
                         return Ok(true);
                     }

@@ -197,21 +197,22 @@ pub(crate) async fn verify_admin_read(state: &GlobalState, headers: &http::Heade
         })
 }
 
-/// Extract a named cookie across all `Cookie` headers (RFC 6265 / RFC 9113).
+/// Extract a named cookie across all `Cookie` headers (RFC 6265 / RFC 9113)
+/// without rejecting unrelated `obs-text` cookies.
 pub(crate) fn extract_cookie_header<'a>(
     headers: &'a http::HeaderMap,
     name: &str,
 ) -> Option<&'a str> {
-    headers
-        .get_all(http::header::COOKIE)
-        .iter()
-        .filter_map(|h| h.to_str().ok())
-        .find_map(|cookies| {
-            cookies.split(';').find_map(|c| {
-                let (k, v) = c.trim().split_once('=')?;
-                (k == name).then_some(v)
-            })
+    let target = name.as_bytes();
+    headers.get_all(http::header::COOKIE).iter().find_map(|h| {
+        h.as_bytes().split(|&b| b == b';').find_map(|c| {
+            let mut parts = c.trim_ascii().splitn(2, |&b| b == b'=');
+            match (parts.next(), parts.next()) {
+                (Some(k), Some(v)) if k == target => std::str::from_utf8(v).ok(),
+                _ => None,
+            }
         })
+    })
 }
 
 #[cfg(test)]
@@ -289,10 +290,16 @@ mod tests {
     }
 
     #[test]
-    fn domains_are_dotted_hostnames() {
-        assert!(is_valid_domain("example.com"));
-        for bad in ["", "localhost", "-a.com", "a..com", "a_b.com", "a/b.com"] {
-            assert!(!is_valid_domain(bad), "{bad}");
-        }
+    fn extract_cookie_tolerates_unrelated_obs_text_cookies() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            http::HeaderValue::from_bytes(b"legacy=\xff\xfe; __Host-x2rp_session=abc123")
+                .expect("valid obs-text header value"),
+        );
+        assert_eq!(
+            extract_cookie_header(&headers, ADMIN_SESSION_COOKIE),
+            Some("abc123")
+        );
     }
 }

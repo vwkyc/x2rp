@@ -228,4 +228,12 @@ mod tests {
             assert!(parse_http_origin(bad).is_err(), "{bad}");
         }
     }
+
+    #[test]
+    fn domains_are_dotted_hostnames() {
+        assert!(is_valid_domain("example.com"));
+        for bad in ["", "localhost", "-a.com", "a..com", "a_b.com", "a/b.com"] {
+            assert!(!is_valid_domain(bad), "{bad}");
+        }
+    }
 }

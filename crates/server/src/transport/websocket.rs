@@ -43,6 +43,8 @@ pub async fn connector_connect(
     let Some(connector_id) = connector_id else {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     };
+    // Unlike QUIC (pre-auth UDP), this handler is already behind edge rate limits and
+    // bearer-token auth; `try_register` enforces the session cap atomically.
     if !state
         .proxy_ctx
         .connectors

@@ -231,10 +231,13 @@ async fn update_connector_kicks_session_only_on_actual_change() {
     let (state, headers) = admin_state(app);
     let registry = state.proxy_ctx.connectors.clone();
     let (to_connector_tx, _to_connector_rx) = mpsc::channel(4);
-    registry.register(Arc::new(ConnectorManager::new(
-        "relay-1".to_string(),
-        Link::Wss(to_connector_tx),
-    )));
+    registry.try_register(
+        Arc::new(ConnectorManager::new(
+            "relay-1".to_string(),
+            Link::Wss(to_connector_tx),
+        )),
+        usize::MAX,
+    );
 
     let _ = update_connector(
         State(state.clone()),
@@ -279,10 +282,13 @@ async fn rotating_or_deleting_a_relay_connector_drops_its_live_session() {
     for id in ["relay-rotate", "relay-delete"] {
         let (to_connector_tx, to_connector_rx) = mpsc::channel(4);
         queues.push(to_connector_rx);
-        registry.register(Arc::new(ConnectorManager::new(
-            id.to_string(),
-            Link::Wss(to_connector_tx),
-        )));
+        registry.try_register(
+            Arc::new(ConnectorManager::new(
+                id.to_string(),
+                Link::Wss(to_connector_tx),
+            )),
+            usize::MAX,
+        );
     }
 
     let _ = regenerate_connector_token(
