@@ -148,13 +148,15 @@ async fn send_error_response(
     let mut resp = ResponseHeader::build(status, None)?;
     resp.insert_header(header::CONTENT_TYPE, "text/plain; charset=utf-8")?;
     resp.insert_header(header::CONTENT_LENGTH, body.len().to_string())?;
-    resp.insert_header(header::CONNECTION, "close")?;
     resp.insert_header(header::CACHE_CONTROL, "no-store")?;
     resp.insert_header("X-Request-Id", request_id)?;
     if status == StatusCode::TOO_MANY_REQUESTS {
         resp.insert_header(header::RETRY_AFTER, "60")?;
     }
     append_standard_security_headers(&mut resp);
+    // Tell Pingora to close the downstream connection (a manual `Connection: close`
+    // header is overwritten by Pingora's HTTP/1 `prepare_response_header`).
+    session.set_keepalive(None);
     session.write_response_header(Box::new(resp), false).await?;
     session.write_response_body(Some(body), true).await?;
     Ok(true)
@@ -388,6 +390,8 @@ impl ProxyContext {
 #[derive(Default)]
 pub struct RequestCtx {
     resource: Option<Arc<ProxyResource>>,
+    /// Canonical lowercase routing hostname (without `:port`) from `parse_host_header`.
+    host: String,
     client_ip: Option<IpAddr>,
     /// Set first in `request_filter`; the same ID tags every log line and response
     /// this request produces.
@@ -454,6 +458,8 @@ impl ProxyHttp for Gateway {
         let Some(host) = parsed_host else {
             return send_error_response(session, &ctx.request_id, StatusCode::BAD_REQUEST).await;
         };
+        ctx.host = host;
+        let host = ctx.host.as_str();
 
         let resource = if is_admin_host {
             static ADMIN: LazyLock<Arc<ProxyResource>> = LazyLock::new(|| {
@@ -466,7 +472,7 @@ impl ProxyHttp for Gateway {
             });
             Arc::clone(&ADMIN)
         } else {
-            let Some(resource) = self.ctx.resources.read().get(&host).cloned() else {
+            let Some(resource) = self.ctx.resources.read().get(host).cloned() else {
                 return send_error_response(session, &ctx.request_id, StatusCode::NOT_FOUND).await;
             };
             resource
@@ -592,7 +598,7 @@ impl ProxyHttp for Gateway {
 
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
@@ -608,18 +614,30 @@ impl ProxyHttp for Gateway {
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
         upstream_request.insert_header("X-Forwarded-Port", "443")?;
         upstream_request.insert_header("X-Request-Id", &ctx.request_id)?;
-        // Origins build absolute URLs (redirects, reset links) from this. Every request
-        // here was routed by its Host, so that Host is the one to forward.
-        if let Some(host) = upstream_request.headers.get(header::HOST).cloned() {
-            upstream_request.insert_header("X-Forwarded-Host", host)?;
+        // Forward the canonical routing host; only rebuild `Host` if a `:port` was sent.
+        if !ctx.host.is_empty() {
+            if upstream_request
+                .headers
+                .get(header::HOST)
+                .is_some_and(|v| v.as_bytes().contains(&b':'))
+            {
+                upstream_request.insert_header(header::HOST, &ctx.host)?;
+            }
+            upstream_request.insert_header("X-Forwarded-Host", &ctx.host)?;
         } else {
             upstream_request.remove_header("X-Forwarded-Host");
         }
 
         // One tunnel per request: pooled, an idle one would hold a connector stream
-        // slot, so have the origin close it after this response. Upgrades
-        // (WebSocket) keep their own `Connection`.
-        if ctx.relay.is_some() && !is_http_upgrade(&upstream_request.headers) {
+        // slot, so have the origin close it after this response. Require a real upgrade
+        // on both the downstream request (so bare `Upgrade: websocket` cannot ride
+        // Pingora's synthesized `Connection: Upgrade`) and the sanitized upstream request
+        // (so non-WebSocket upgrades stripped by Pingora still get `Connection: close`).
+        if ctx.relay.is_some()
+            && !(is_http_upgrade(&session.req_header().headers)
+                && is_http_upgrade(&upstream_request.headers))
+        {
+            upstream_request.remove_header(&header::UPGRADE);
             upstream_request.insert_header(header::CONNECTION, "close")?;
         }
 

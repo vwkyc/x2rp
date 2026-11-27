@@ -48,15 +48,25 @@ main() {
         esac
     done
 
+    # An https origin only: no path, query, fragment, whitespace, or userinfo.
+    origin_re='^https://[][A-Za-z0-9.:-]+$'
+
     if [[ $MODE == uninstall ]]; then
         [[ -f $UNIT || -f $BIN ]] || { echo "$NAME is not installed"; exit 0; }
         confirm "Remove $NAME?" || exit 0
         # Tell the server first so the admin console shows it offline right away.
-        # The token goes to curl on stdin, so it never shows in the process list.
-        if [[ -f $CONF ]] && command -v jq >/dev/null; then
-            printf 'Authorization: Bearer %s\n' "$(jq -r .token "$CONF")" |
-                curl -fsS -m 5 -X POST -H @- "$(jq -r .server "$CONF")/api/connector/disconnect" \
-                    >/dev/null 2>&1 || true
+        # Validate values from the service-owned config before invoking curl as root.
+        if [[ -f $CONF ]] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+            SERVER_NOTIFY=$(jq -r '.server // empty' "$CONF" 2>/dev/null || true)
+            SERVER_NOTIFY="${SERVER_NOTIFY%/}"
+            TOKEN_NOTIFY=$(jq -r '.token // empty' "$CONF" 2>/dev/null || true)
+            if [[ $SERVER_NOTIFY =~ $origin_re && $TOKEN_NOTIFY =~ ^[[:graph:]]+$ ]]; then
+                # The token goes to curl on stdin, so it never shows in the process list.
+                curl -fsS -m 5 --proto '=https' -X POST -H @- -- \
+                    "${SERVER_NOTIFY}/api/connector/disconnect" \
+                    <<<"Authorization: Bearer ${TOKEN_NOTIFY}" >/dev/null 2>&1 || true
+            fi
+            unset TOKEN_NOTIFY SERVER_NOTIFY
         fi
         stop_service
         rm -rf "$UNIT" "$BIN" "$CONF_DIR" "$SYSCTL"
@@ -72,8 +82,6 @@ main() {
         echo "Upgrading $NAME, keeping $CONF"
     else
         [[ -n $SERVER && -n $TOKEN ]] || die "--server and --token are required"
-        # An https origin only: no path, query, fragment or userinfo.
-        origin_re='^https://[][A-Za-z0-9.:-]+$'
         [[ $SERVER =~ $origin_re ]] || die "--server must look like https://x2rp.example.com"
         [[ ! -f $UNIT ]] || confirm "Replace the installed $NAME?" || exit 1
     fi

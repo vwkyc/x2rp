@@ -104,9 +104,14 @@ pub fn is_valid_host(host: &str) -> bool {
     !host.is_empty() && host.len() <= 253 && host.split('.').all(is_valid_label)
 }
 
-/// A hostname with at least two labels.
+/// A hostname with at least two labels and a non-numeric TLD (rejects bare IPv4 literals).
 pub fn is_valid_domain(domain: &str) -> bool {
-    domain.contains('.') && is_valid_host(domain)
+    domain.contains('.')
+        && is_valid_host(domain)
+        && domain
+            .rsplit('.')
+            .next()
+            .is_some_and(|tld| !tld.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Reject non-canonical numeric IPv4 shorthands (decimal, hex, octal, 2/3-part)
@@ -232,7 +237,15 @@ mod tests {
     #[test]
     fn domains_are_dotted_hostnames() {
         assert!(is_valid_domain("example.com"));
-        for bad in ["", "localhost", "-a.com", "a..com", "a_b.com", "a/b.com"] {
+        for bad in [
+            "",
+            "localhost",
+            "127.0.0.1",
+            "-a.com",
+            "a..com",
+            "a_b.com",
+            "a/b.com",
+        ] {
             assert!(!is_valid_domain(bad), "{bad}");
         }
     }

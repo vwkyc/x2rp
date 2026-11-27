@@ -44,6 +44,35 @@ struct ActiveStream {
     recv_outstanding: Arc<AtomicUsize>,
 }
 
+/// Releases a reserved `active_streams` slot when its tunnel finishes (or is dropped),
+/// keeping the slot held even after `Message::Close` until buffered download bytes drain.
+struct StreamSlotGuard {
+    manager: Arc<ConnectorManager>,
+    released: bool,
+}
+
+impl StreamSlotGuard {
+    fn new(manager: Arc<ConnectorManager>) -> Self {
+        Self {
+            manager,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.manager.release_stream_slot();
+        }
+    }
+}
+
+impl Drop for StreamSlotGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub struct ConnectorManager {
     connector_id: String,
     link: Link,
@@ -118,14 +147,15 @@ impl ConnectorManager {
             .try_update(Ordering::AcqRel, Ordering::Relaxed, |c| c.checked_sub(1));
     }
 
-    /// Idempotent teardown of one WSS stream: frees its slot, wakes its upload, and
-    /// fails a still-pending connect so a late ConnectOk cannot start it.
+    /// Idempotent teardown of one WSS stream: unregisters its channels, wakes its upload,
+    /// and fails a still-pending connect so a late ConnectOk cannot start it.
+    /// Does not release `active_streams`; [`StreamSlotGuard`] holds the slot until
+    /// `wss_tunnel` finishes draining any queued download bytes.
     fn remove_stream(&self, stream_id: u32) {
         let Some(stream) = self.streams.write().remove(&stream_id) else {
             return;
         };
         stream.send_credit.close();
-        self.release_stream_slot();
         if let Some(pending) = self.pending.write().remove(&stream_id) {
             let _ = pending.send(Err("stream closed".to_string()));
         }
@@ -151,15 +181,16 @@ impl ConnectorManager {
             ));
         }
         let (this, target) = (self.clone(), target.to_string());
+        let mut slot = StreamSlotGuard::new(self.clone());
         tokio::spawn(async move {
             match &this.link {
                 Link::Quic(connection) => {
                     if let Err(e) = quic_tunnel(connection, target, stream, cancel).await {
                         warn!("QUIC tunnel for {}: {e}", this.connector_id);
                     }
-                    this.release_stream_slot();
+                    slot.release();
                 }
-                Link::Wss(tx) => this.wss_tunnel(tx, stream, target, cancel).await,
+                Link::Wss(tx) => this.wss_tunnel(tx, stream, target, cancel, &mut slot).await,
             }
         });
         Ok(())
@@ -171,6 +202,7 @@ impl ConnectorManager {
         stream: S,
         target: String,
         cancel: Option<oneshot::Receiver<()>>,
+        slot: &mut StreamSlotGuard,
     ) where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
@@ -237,6 +269,7 @@ impl ConnectorManager {
         if let Some(reason) = failure {
             warn!("Stream {stream_id} {reason}");
             self.remove_stream(stream_id);
+            slot.release();
             // A connect that lands after we gave up must not leave a backend open.
             let _ = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -323,6 +356,7 @@ impl ConnectorManager {
             },
         };
         self.remove_stream(stream_id);
+        slot.release();
         if aborted {
             let _ = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -754,6 +788,42 @@ mod tests {
             .bridge_cancellable("http://example.internal", stream, None)
             .expect_err("connector should reject streams beyond the cap");
         assert!(err.contains("active stream cap"));
+    }
+
+    #[tokio::test]
+    async fn wss_close_holds_stream_slot_until_buffered_download_drains() {
+        let (manager, mut rx) = test_manager(8);
+        // Tiny 64-byte duplex buffer so a 16 KiB response stalls until the client reads.
+        let (stream_id, mut peer_end) = bridged(&manager, &mut rx, 64).await;
+        manager.handle_message(Message::ConnectOk { stream_id });
+        manager.handle_message(Message::Data {
+            stream_id,
+            payload: Bytes::from(vec![b'a'; 16 * 1024]),
+        });
+        manager.handle_message(Message::Close { stream_id });
+
+        tokio::task::yield_now().await;
+        assert!(manager.streams.read().is_empty());
+        assert_eq!(
+            manager.active_streams.load(Ordering::Acquire),
+            1,
+            "slot must stay held while wss_tunnel is still draining queued bytes"
+        );
+
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), peer_end.read_to_end(&mut out))
+            .await
+            .expect("drain should complete")
+            .expect("read should succeed");
+        assert_eq!(out.len(), 16 * 1024);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while manager.active_streams.load(Ordering::Acquire) != 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(manager.active_streams.load(Ordering::Acquire), 0);
     }
 
     #[test]
