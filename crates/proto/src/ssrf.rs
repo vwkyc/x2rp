@@ -14,40 +14,29 @@ pub fn is_strictly_dangerous_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             v4.octets()[0] == 0 // 0.0.0.0/8
-                || v4.is_link_local() // 169.254.0.0/16
+                || v4.is_link_local() // 169.254.0.0/16 (incl. 169.254.169.254 metadata)
                 || v4.is_multicast() // 224.0.0.0/4
                 || v4 == Ipv4Addr::BROADCAST
-                || is_metadata_ip(IpAddr::V4(v4))
+                // Cloud metadata/host-agent endpoints outside link-local (Alibaba, Azure, Oracle).
+                || matches!(
+                    v4.octets(),
+                    [100, 100, 100, 200] | [168, 63, 129, 16] | [192, 0, 0, 192]
+                )
         }
         IpAddr::V6(v6) => {
+            let s = v6.segments();
             v6.is_unspecified()
                 || v6.is_unicast_link_local() // fe80::/10
                 || v6.is_multicast() // ff00::/8
                 // Reject the RFC 8215 local-use NAT64 block (`64:ff9b:1::/48`) because prefix
                 // boundaries vary per deployment.
-                || v6.segments()[..3] == [0x0064, 0xff9b, 0x0001]
-                || is_metadata_ip(IpAddr::V6(v6))
-                || to_ipv4_synthesized(v6)
-                    .is_some_and(|v4| is_strictly_dangerous_ip(IpAddr::V4(v4)))
-        }
-    }
-}
-
-/// Returns true if `ip` is a known cloud instance metadata or host-agent address.
-fn is_metadata_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4 == Ipv4Addr::new(169, 254, 169, 254)
-                || v4 == Ipv4Addr::new(100, 100, 100, 200)
-                || v4 == Ipv4Addr::new(168, 63, 129, 16)
-                || v4 == Ipv4Addr::new(192, 0, 0, 192)
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            (s[0] == 0xfd00 && s[1] == 0x0ec2)
+                || s[..3] == [0x0064, 0xff9b, 0x0001]
+                // Cloud IPv6 metadata endpoints (AWS, GCP, Oracle).
+                || (s[0] == 0xfd00 && s[1] == 0x0ec2)
                 || v6 == Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254)
                 || v6 == Ipv6Addr::new(0xfd00, 0x00c1, 0, 0, 0, 0, 0xa9fe, 0xa9fe)
-                || to_ipv4_synthesized(v6).is_some_and(|v4| is_metadata_ip(IpAddr::V4(v4)))
+                || to_ipv4_synthesized(v6)
+                    .is_some_and(|v4| is_strictly_dangerous_ip(IpAddr::V4(v4)))
         }
     }
 }

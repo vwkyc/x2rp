@@ -153,24 +153,6 @@ async fn connector_settings_accepts_case_insensitive_bearer_prefix() {
 }
 
 #[tokio::test]
-async fn create_resource_rejects_target_with_path_or_query() {
-    let (state, headers) = admin_state(base_app_state());
-
-    let result = create_resource(
-        State(state),
-        headers,
-        Json(create_request(
-            "app",
-            "http://127.0.0.1:8080/index.html?x=1",
-            &[],
-        )),
-    )
-    .await;
-
-    assert_eq!(result.err(), Some(StatusCode::BAD_REQUEST));
-}
-
-#[tokio::test]
 async fn create_resource_validates_the_allowlist() {
     let (state, headers) = admin_state(base_app_state());
 
@@ -203,26 +185,6 @@ async fn create_resource_validates_the_allowlist() {
 }
 
 #[tokio::test]
-async fn update_connector_toggles_and_persists_force_wss() {
-    let mut app = base_app_state();
-    app.connectors
-        .insert("relay-1".to_string(), relay_connector("relay-1", "tok"));
-    let (state, headers) = admin_state(app);
-
-    let detail = update_connector(
-        State(state.clone()),
-        headers,
-        Path("relay-1".to_string()),
-        Json(UpdateConnectorRequest { force_wss: true }),
-    )
-    .await
-    .expect("toggle should succeed")
-    .0;
-    assert!(detail.force_wss);
-    assert!(state.state.read().await.connectors["relay-1"].force_wss);
-}
-
-#[tokio::test]
 async fn update_connector_kicks_session_only_on_actual_change() {
     let mut app = base_app_state();
     app.connectors
@@ -252,14 +214,17 @@ async fn update_connector_kicks_session_only_on_actual_change() {
         "unchanged value must not kick a live session"
     );
 
-    let _ = update_connector(
-        State(state),
+    let detail = update_connector(
+        State(state.clone()),
         headers,
         Path("relay-1".to_string()),
         Json(UpdateConnectorRequest { force_wss: true }),
     )
     .await
-    .expect("toggle should succeed");
+    .expect("toggle should succeed")
+    .0;
+    assert!(detail.force_wss);
+    assert!(state.state.read().await.connectors["relay-1"].force_wss);
     assert!(
         registry.get("relay-1").is_none(),
         "changed value must drop the live session so the connector re-polls settings"

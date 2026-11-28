@@ -5,6 +5,49 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::Command;
 
+/// Subcommands shared by the `x2rp` and `x2rp-connector` binaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliCommand {
+    Run,
+    Status,
+    Logs,
+}
+
+/// Parse single-argument CLI commands (`run`, `status`, `logs`, `-h`, `-V`).
+pub fn parse_cli(bin: &str, version: &str, usage: &str, default_run: bool) -> CliCommand {
+    let mut args = std::env::args().skip(1);
+    let Some(cmd) = args.next() else {
+        if default_run {
+            return CliCommand::Run;
+        }
+        eprint!("{usage}");
+        std::process::exit(2);
+    };
+    if args.next().is_some() {
+        eprintln!("Unexpected extra argument");
+        eprint!("{usage}");
+        std::process::exit(2);
+    }
+    match cmd.as_str() {
+        "run" => CliCommand::Run,
+        "status" => CliCommand::Status,
+        "logs" => CliCommand::Logs,
+        "help" | "-h" | "--help" => {
+            print!("{usage}");
+            std::process::exit(0);
+        }
+        "-V" | "--version" => {
+            println!("{bin} {version}");
+            std::process::exit(0);
+        }
+        other => {
+            eprintln!("Unknown command: {other}");
+            eprint!("{usage}");
+            std::process::exit(2);
+        }
+    }
+}
+
 /// `systemctl status` for `service`. A stopped unit exits non-zero; that is an
 /// answer, not an error.
 pub fn cmd_status(service: &str) -> io::Result<()> {

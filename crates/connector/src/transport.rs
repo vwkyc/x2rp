@@ -97,6 +97,13 @@ pub(crate) async fn https_get(
         (false, 443) => host,
         (false, p) => format!("{host}:{p}"),
     };
+    let has_crlf = |s: &str| s.bytes().any(|b| matches!(b, b'\r' | b'\n'));
+    if has_crlf(path) || has_crlf(&config.token) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "request path/token must not contain CR or LF",
+        ));
+    }
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
         config.token

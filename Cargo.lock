@@ -3298,7 +3298,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "x2rp"
-version = "1.1.2"
+version = "1.1.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3339,7 +3339,7 @@ dependencies = [
 
 [[package]]
 name = "x2rp-connector"
-version = "1.1.2"
+version = "1.1.3"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3360,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "x2rp-proto"
-version = "1.1.2"
+version = "1.1.3"
 dependencies = [
  "bytes",
  "chacha20",

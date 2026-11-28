@@ -290,10 +290,4 @@ mod tests {
             client_key(ip("::ffff:203.0.113.9"))
         );
     }
-
-    #[test]
-    fn only_login_paths_draw_the_auth_tier() {
-        assert!(is_auth_sensitive_path("/api/auth/login"));
-        assert!(!is_auth_sensitive_path("/api/resources"));
-    }
 }

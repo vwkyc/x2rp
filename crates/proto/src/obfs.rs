@@ -88,9 +88,10 @@ fn encode_transmit<'a>(
     let segment_count = transmit.contents.len().div_ceil(segment_size);
     out.reserve(transmit.contents.len() + IV_LEN * segment_count);
 
+    let mut rng = rand::rng();
     for chunk in transmit.contents.chunks(segment_size) {
         let mut iv = [0u8; IV_LEN];
-        rand::rng().fill_bytes(&mut iv);
+        rng.fill_bytes(&mut iv);
         out.extend_from_slice(&iv);
 
         let start = out.len();

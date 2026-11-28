@@ -26,57 +26,18 @@ use x2rp::{http_middleware, security_headers, static_files, tls, transport};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const SERVICE: &str = "x2rp";
-
-enum Command {
-    Run,
-    Status,
-    Logs,
-}
-
-fn usage() -> &'static str {
-    "Usage: x2rp [run|status|logs]\n\n\
+const USAGE: &str = "Usage: x2rp [run|status|logs]\n\n\
      x2rp reverse proxy\n\n\
      Commands:\n  \
        run     Run the server (default)\n  \
        status  Show service status\n  \
-       logs    Follow logs\n"
-}
-
-fn parse_cli() -> Command {
-    let mut args = std::env::args().skip(1);
-    let Some(cmd) = args.next() else {
-        return Command::Run;
-    };
-    if args.next().is_some() {
-        eprintln!("Unexpected extra argument");
-        eprint!("{}", usage());
-        std::process::exit(2);
-    }
-    match cmd.as_str() {
-        "run" => Command::Run,
-        "status" => Command::Status,
-        "logs" => Command::Logs,
-        "help" | "-h" | "--help" => {
-            print!("{}", usage());
-            std::process::exit(0);
-        }
-        "-V" | "--version" => {
-            println!("x2rp {}", env!("CARGO_PKG_VERSION"));
-            std::process::exit(0);
-        }
-        other => {
-            eprintln!("Unknown command: {other}");
-            eprint!("{}", usage());
-            std::process::exit(2);
-        }
-    }
-}
+       logs    Follow logs\n";
 
 fn main() {
-    let result = match parse_cli() {
-        Command::Run => run_server(),
-        Command::Status => x2rp_proto::cmd_status(SERVICE).map_err(Into::into),
-        Command::Logs => x2rp_proto::cmd_logs(SERVICE).map_err(Into::into),
+    let result = match x2rp_proto::parse_cli(SERVICE, env!("CARGO_PKG_VERSION"), USAGE, true) {
+        x2rp_proto::CliCommand::Run => run_server(),
+        x2rp_proto::CliCommand::Status => x2rp_proto::cmd_status(SERVICE).map_err(Into::into),
+        x2rp_proto::CliCommand::Logs => x2rp_proto::cmd_logs(SERVICE).map_err(Into::into),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");
@@ -192,6 +153,7 @@ async fn run_server() -> anyhow::Result<()> {
         ));
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel::<Option<StopKind>>(None);
+    let cert_shutdown_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         let kind = shutdown_signal().await;
         let _ = shutdown_tx.send(Some(kind));
@@ -353,7 +315,8 @@ async fn run_server() -> anyhow::Result<()> {
                     Err(e) => {
                         // systemd (`Restart=always`) brings us back on the new files.
                         tracing::error!("Renewed certificate did not load ({e:#}); restarting");
-                        std::process::exit(1);
+                        let _ = cert_shutdown_tx.send(Some(StopKind::Graceful));
+                        return;
                     }
                 },
                 Ok(false) => {}

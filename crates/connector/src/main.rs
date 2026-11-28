@@ -32,51 +32,12 @@ const STABLE_SESSION: Duration = Duration::from_secs(30);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-enum Command {
-    Run,
-    Status,
-    Logs,
-}
-
-fn usage() -> &'static str {
-    "Usage: x2rp-connector <run|status|logs>\n\n\
+const USAGE: &str = "Usage: x2rp-connector <run|status|logs>\n\n\
      x2rp connector (QUIC with WebSocket fallback)\n\n\
      Commands:\n  \
        run     Run the connector (used by systemd)\n  \
        status  Show service status\n  \
-       logs    Show connector logs (follows journald)\n"
-}
-
-fn parse_cli() -> Command {
-    let mut args = std::env::args().skip(1);
-    let Some(cmd) = args.next() else {
-        eprint!("{}", usage());
-        std::process::exit(2);
-    };
-    if args.next().is_some() {
-        eprintln!("Unexpected extra argument");
-        eprint!("{}", usage());
-        std::process::exit(2);
-    }
-    match cmd.as_str() {
-        "run" => Command::Run,
-        "status" => Command::Status,
-        "logs" => Command::Logs,
-        "help" | "-h" | "--help" => {
-            print!("{}", usage());
-            std::process::exit(0);
-        }
-        "-V" | "--version" => {
-            println!("x2rp-connector {}", env!("CARGO_PKG_VERSION"));
-            std::process::exit(0);
-        }
-        other => {
-            eprintln!("Unknown command: {other}");
-            eprint!("{}", usage());
-            std::process::exit(2);
-        }
-    }
-}
+       logs    Show connector logs (follows journald)\n";
 
 #[derive(Deserialize)]
 struct Config {
@@ -115,10 +76,21 @@ fn log_filter() -> tracing_subscriber::filter::Targets {
     parse_log_filter(std::env::var("RUST_LOG").ok().as_deref())
 }
 
-#[tokio::main]
-async fn main() {
-    let command = parse_cli();
+fn main() {
+    let result = match x2rp_proto::parse_cli(SERVICE, env!("CARGO_PKG_VERSION"), USAGE, false) {
+        x2rp_proto::CliCommand::Run => cmd_run(),
+        x2rp_proto::CliCommand::Status => x2rp_proto::cmd_status(SERVICE).map_err(Into::into),
+        x2rp_proto::CliCommand::Logs => x2rp_proto::cmd_logs(SERVICE).map_err(Into::into),
+    };
 
+    if let Err(e) = result {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[tokio::main]
+async fn cmd_run() -> Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     tracing_subscriber::registry()
         .with(log_filter())
@@ -133,19 +105,6 @@ async fn main() {
         .install_default()
         .expect("Failed to install Rustls crypto provider");
 
-    let result = match command {
-        Command::Run => cmd_run().await,
-        Command::Status => x2rp_proto::cmd_status(SERVICE).map_err(Into::into),
-        Command::Logs => x2rp_proto::cmd_logs(SERVICE).map_err(Into::into),
-    };
-
-    if let Err(e) = result {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
-    }
-}
-
-async fn cmd_run() -> Result<()> {
     info!("x2rp connector starting");
     let config = load_config()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

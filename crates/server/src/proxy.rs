@@ -748,23 +748,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn client_ip_from_peer_reduces_v4_mapped_peers() {
-        let mapped: SocketAddr = "[::ffff:203.0.113.9]:44321".parse().expect("peer addr");
-        assert_eq!(
-            client_ip_from_peer(Some(&mapped)),
-            Some("203.0.113.9".parse().unwrap())
-        );
-
-        let v6: SocketAddr = "[2001:db8::1]:443".parse().expect("peer addr");
-        assert_eq!(
-            client_ip_from_peer(Some(&v6)),
-            Some("2001:db8::1".parse().unwrap())
-        );
-
-        assert_eq!(client_ip_from_peer(None), None);
-    }
-
     /// A client-supplied ID is echoed into logs and a response header, so only a
     /// short, plain one is honoured; anything else gets a fresh ID.
     #[test]

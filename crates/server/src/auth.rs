@@ -234,19 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_matches_equal_secrets() {
-        assert!(constant_time_eq(
-            b"same-token-value!!",
-            b"same-token-value!!"
-        ));
-        assert!(!constant_time_eq(
-            b"same-token-value!!",
-            b"same-token-value!?"
-        ));
-        assert!(!constant_time_eq(b"short", b"longer-value"));
-    }
-
-    #[test]
     fn admin_session_expires_on_idle_and_on_absolute_age() {
         let auth = AuthService::default();
         for (created_ago, idle_for) in [

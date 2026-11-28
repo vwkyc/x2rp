@@ -234,14 +234,7 @@ impl ConnectorManager {
         }
 
         // Resolves once the caller drops its pipe handle; pending forever if no cancel was given.
-        let cancelled = async move {
-            match cancel {
-                Some(rx) => {
-                    let _ = rx.await;
-                }
-                None => std::future::pending::<()>().await,
-            }
-        };
+        let cancelled = await_cancel(cancel);
         tokio::pin!(cancelled);
 
         // Bounded, so a full channel cannot park this bridge forever.
@@ -438,6 +431,15 @@ impl ConnectorManager {
     }
 }
 
+async fn await_cancel(cancel: Option<oneshot::Receiver<()>>) {
+    match cancel {
+        Some(rx) => {
+            let _ = rx.await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// One QUIC tunnel: `Connect` out, `ConnectOk` / `ConnectErr` back, then a splice.
 /// Dropping the streams (or cancelling via `RelayPipe::drop`) resets the tunnel immediately.
 async fn quic_tunnel<S>(
@@ -449,14 +451,7 @@ async fn quic_tunnel<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let cancelled = async move {
-        match cancel {
-            Some(rx) => {
-                let _ = rx.await;
-            }
-            None => std::future::pending::<()>().await,
-        }
-    };
+    let cancelled = await_cancel(cancel);
     tokio::pin!(cancelled);
 
     let open = async {

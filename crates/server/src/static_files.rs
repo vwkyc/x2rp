@@ -78,14 +78,10 @@ mod tests {
         }
         // A path that dodges the check must not reach the console either.
         assert_eq!(serve_static("//admin.html").status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn html_documents_are_served_no_store() {
-        let response = serve_static("/");
-        assert_eq!(response.status(), StatusCode::OK);
+        let root = serve_static("/");
+        assert_eq!(root.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            root.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
     }
